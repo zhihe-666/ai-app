@@ -701,7 +701,7 @@ frontend/
 
 ---
 
-## 实际实现差异（截至 2026-07-03）
+## 实际实现差异（截至 2026-07-06）
 
 ### 代码变更分析模块 — 主要架构变更
 
@@ -711,6 +711,9 @@ frontend/
 | LLM 自行决定分类（新增/修改/UI） | **AST 决策树**决定分类，LLM 只做语义描述 | LLM 分类不可靠，AST 决策树确定可复现 |
 | LLM 自评 confidence | **AST 客观计算**confidence（信号覆盖度） | LLM 自评分数不可靠 |
 | `temperature=0` 保证确定性 | **temperature=0 + seed=42** | 分布式 GPU 浮点非确定性，seed 进一步约束 |
+| 10 类信号 | **14 类信号**（+GENERIC_CHANGE/TEXT_CHANGE/TYPE_CHANGE/TEST_CHANGE） | 信号细粒度优化 |
+| 聚类仅 Import Graph 连通分量 | **+page-logic/pages 合并 + constant/types 拆分** | 更干净的 Feature Group 划分 |
+| 两步 LLM（step1 概括 + step2 展开） | **单步 LLM（max_tokens=4096）** | 两步报错率翻倍、重复名称问题 |
 
 ### 新增功能
 
@@ -718,6 +721,7 @@ frontend/
 - **Git 令牌管理**：全局配置弹窗 Git Token 区域
 - **commit_cache**：相同时间范围复用相同 commit hash，保证结果一致
 - **调试持久化**：`_preserve_debug_files` 保存 AST result.json 到 `/tmp/analyze_debug/`
+- **行号级信号定位**：Signal 类型新增 `line` 字段
 
 ### 架构变更
 

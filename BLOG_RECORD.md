@@ -920,3 +920,53 @@ Phase 7 全部功能已稳定：
 **修复：** 验证策略从"找不到就移除"改为"不确定就保留"。STYLE_ONLY 更特殊——被移除时用 GENERIC_CHANGE 信号代替，让决策树至少能归为 FEATURE_MODIFY 而不是 STYLE_ONLY。
 
 **教训：** 验证器的三个策略是"确认假阳性才移除"、"确认假阳性且无替代时替换"、"不确定时保留"。一开始选了最严格的"找不到就移除"，结果过度过滤。验证器应该保守——宁愿漏掉一个假阳性，也不能错杀一个真信号。
+
+---
+
+## Episode 26: 信号拆细了，但 LLM 反而更稳了（2026-07-03）
+
+**需求：** 用户验收了 5 项优化中的 5 项（方向 6 描述质量校验层暂时不搞），优先级：信号细粒度（constant/types 拆分 + 新增 TEXT/TYPE/TEST 信号）→ 两步 LLM 回归单步。
+
+### 信号细粒度：三个小改动
+
+**改动 1 — 聚类后拆分 constant/types 文件**
+
+之前 `constant.ts` 和功能组件通过 import 关系聚在同一组，LLM 描述把文案和功能混在一起。`cluster.ts` 加了一个 `splitTextFileClusters()` 函数：检测 3 文件以上的大簇，把 `constant.ts`、`types.ts`、`contant.ts` 抽出来独立成组。
+
+**改动 2 — 新增 3 种信号类型**
+
+- `TEXT_CHANGE`：`constant.ts` 文件内容变更 → 归为"文案变更"
+- `TYPE_CHANGE`：`types.ts` 新增 interface/type/enum → 归为 INFRA_CHANGE
+- `TEST_CHANGE`：`*.test.ts`/`*.spec.ts` 文件变更 → 单独展示
+
+每个新增的信号提取器不超过 40 行，全部在 `contentType.ts` 中。简单到不需要 AST 验证——文件名匹配 + 行内容正则就够了。
+
+**改动 3 — 行号级信号定位**
+
+`Signal` 类型加了 `line` 字段。`extractor.ts` 在提取信号后，自动用 addedLines 的前 30 字符匹配确定行号。LLM 输入中会附带行号信息。
+
+### LLM 回归：从两步回到单步
+
+之前为了减少报错，把 LLM 拆成了两步——step1 概括 category，step2 展开 description。结果：
+
+- 两步各可能失败 → 报错率翻倍
+- 失败组返回空 category → 多个组重叠显示"未知变更"
+- step1 和 step2 的 type 分类可能不一致
+
+用户说："不用担心 token 消耗，我要的是确保提取质量足够高。"
+
+于是回归单步调用。`max_tokens` 从 1024 提升到 4096，加了一层重试（解析失败时重试 1 次），加了一层代码级别覆盖——如果 category 以"新增"开头，type 强制设为 NEW_FEATURE。失败了就用文件名兜底，不再出现空 category 和重复名称。
+
+### 最终模块状态
+
+经过 7 月 3 日全天的 5 项优化迭代，功能变更分析模块达到以下状态：
+
+| 维度 | 状态 |
+|------|------|
+| 信号类型 | 14 种（NEW_ROUTE / NEW_PAGE / API_CALL / STATE_ACTION / PERMISSION / HOOK_DEF / EVENT_HANDLER / DATA_MODEL / CONFIG_CHANGE / STYLE_ONLY / GENERIC_CHANGE / TEXT_CHANGE / TYPE_CHANGE / TEST_CHANGE） |
+| 信号提取 | 正则发现 + AST 验证双层过滤（保守策略：不确定时保留） |
+| 聚类 | Import Graph 连通分量 + 目录聚类兜底 + page-logic/pages 合并 + constant/types 拆分 |
+| 分类 | AST 决策树 + LLM type 修正（单步调用，max_tokens=4096） |
+| 稳定性 | seed=42 + temperature=0.0 + 逐组调用（1:1 对齐） |
+| 导出 | Markdown 下载 + 飞书文档 |
+| 多仓库 | 可编辑 URL/分支，SQLite 缓存配置 |

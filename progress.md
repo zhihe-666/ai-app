@@ -601,3 +601,48 @@ Console 输出 `completedRef: Array(3)` 缺 active_rate。根因: 手写 SSE 解
 - `tools/code-analyzer/src/signals/astValidator.ts` — 重写验证逻辑
 - `tools/code-analyzer/src/types.ts` — 新增 GENERIC_CHANGE
 - `tools/code-analyzer/src/classify/decisionTree.ts` — 处理 GENERIC_CHANGE
+
+---
+
+## 2026-07-03 · 信号细粒度优化 + LLM 单步回归
+
+### 信号细粒度优化（3 项优化完成）
+
+#### 优化 1：聚类后拆分 constant/types 文件
+- **问题**：`constant.ts`/`types.ts` 文案文件和 `index.tsx` 功能组件聚在同一组，LLM 描述时文案和功能混在一起
+- **修复**：`cluster.ts` 新增 `splitTextFileClusters()` post-processing 函数，检测组内纯 `constant.ts`/`types.ts`/`contant.ts` 文件，拆成独立组
+- 只拆分 3+ 文件的大簇，小簇保持完整
+
+#### 优化 2：新增 TEXT_CHANGE / TYPE_CHANGE / TEST_CHANGE 信号类型
+- **TEXT_CHANGE**：`constant.ts` 文件内容变更（字符串/对象字面量）→ 归为"文案变更"
+- **TYPE_CHANGE**：`types.ts` 文件新增 interface/type/enum → 归为 INFRA_CHANGE
+- **TEST_CHANGE**：`*.test.ts`/`*.spec.ts` 文件变更 → 单独展示
+- 新增 `contentType.ts` 信号提取器
+
+#### 优化 3：行号级信号定位
+- `Signal` 类型新增 `line` 字段
+- `extractor.ts` 在提取后自动匹配 addedLines 的前 30 字符填充行号
+
+### LLM 优化：从两步回归单步
+
+#### 背景
+之前为了减少 LLM 报错，将 LLM 拆为两步（step1 概括 category + step2 展开 description），但两步调用导致：
+- 报错率翻倍（两步各可能失败）
+- 重复名称：失败组返回空 category → 多组重叠
+- 分类不一致：step1 和 step2 可能对同一组有不同判断
+
+#### 修复
+- 回归单步调用 `describe_group()`，一次性输出 `{category, description, type}`
+- `max_tokens` 从 1024(step2) 提升到 4096
+- 重试机制：解析失败时自动重试 1 次
+- 代码层 category→type 覆盖：`"新增"`/`"新建"` → NEW_FEATURE，`"移除"`/`"删除"` → FEATURE_REMOVAL
+- Promp 明确约束："如果 category 以'新增'或'新建'开头，type 必须为 NEW_FEATURE"
+- 失败兜底：文件名作为 category，error 信息作为 description
+
+### 涉及文件
+- `backend/services/code_analyze_service.py` — 重写 describe_group（单步+max_tokens=4096+重试+代码层覆盖）
+- `tools/code-analyzer/src/signals/contentType.ts` — 新建
+- `tools/code-analyzer/src/signals/extractor.ts` — 注册 contentType 信号 + 行号匹配
+- `tools/code-analyzer/src/graph/cluster.ts` — 新增 splitTextFileClusters + mergePageLogicClusters
+- `tools/code-analyzer/src/types.ts` — 新增 GENERIC_CHANGE / TEXT_CHANGE / TYPE_CHANGE / TEST_CHANGE + line 字段
+- `tools/code-analyzer/src/classify/decisionTree.ts` — 处理新信号类型

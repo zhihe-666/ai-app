@@ -1,0 +1,4 @@
+flask_dir: backend
+port: 5000
+react_dir: frontend
+type: flask-react

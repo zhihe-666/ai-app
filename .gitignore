@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+*.egg
+.pip_packages/
+
+# Node
+node_modules/
+dist/
+build/
+.next/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data & cache
+data/
+backend/data/
+
+# Secrets & config
+.env
+.env.local
+*.token
+**/config.yaml
+
+# Logs
+*.log
+logs/
+
+# Debug
+api_response_debug.json
+extract_pv.py
+inspect_files.py
+test_drilldown.py
+
+# Design docs & data
+前端代码变更分析模块-完整实现方案.md
+用户pv统计.xlsx
+
+# Claude config
+.dclaw/
+memory/
+skills/
+
+# Downloads
+download.txt

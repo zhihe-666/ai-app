@@ -237,6 +237,20 @@
 - [x] index.ts 创建 ts-morph Project + 加载源文件传入 extractor
 - [x] 修复 validator 过度过滤（`keep`/`remove`/`replace` 策略 + `GENERIC_CHANGE` 信号）
 
+### Phase 8: PRD 智能生成模块 MVP
+- **Status:** done ✅
+- **完成时间:** 2026-07-06
+- **目标:** 基于 MVP 方案，实现 PRD 智能生成工作台的完整前端+后端链路
+- **最终状态：**
+  - 两种生成模式：简单模式（大纲→逐章节流式）、中等模式（3-5 轮问答→大纲→章节）
+  - 信息完备度检查（6 项核心信息，≥80% 达标）
+  - 版本管理（最近 3 版自动快照 + 回退）
+  - 飞书妙记链接解析（复用现有 feishu_client）
+  - 文件上传（.md/.txt/.docx，≤10MB，临时/长期分类）
+  - 导出 Markdown（Content-Disposition: attachment）
+  - Diff 对比视图（react-diff-viewer-continued，前端实时计算）
+  - 技术栈适配：Flask + SQLite（全量存储） + react-markdown + Ant Design 6
+
 ---
 
 ## Errors Encountered
@@ -261,3 +275,11 @@
 | 正则提取 + AST 验证两层分离 | 正则负责召回率高，AST 负责精确率高，不混合 | 2026-07-03 |
 | LLM 逐组调用可修正 type | LLM 比纯代码更懂业务意图，但有严格约束（仅 STYLE_ONLY↔FEATURE_MODIFY） | 2026-07-03 |
 | ts-morph 保持轻量模式 | 无需 TypeChecker，节省 2-5 分钟加载时间，收益有限 | 2026-07-03 |
+| PRD 智能生成模块技术栈适配（FastAPI→Flask, Redis→SQLite, Milkdown→react-markdown, JSONB→TEXT） | 与现有 AI 中控台技术栈保持一致，减少依赖 | 2026-07-06 |
+| 数据库存储 JSON 用 TEXT 而非 JSONB | SQLite 不支持 JSONB 类型 | 2026-07-06 |
+| 章节内容直接存 session 表（section_contents 字段） | 替代每次从版本表读取，提升编辑和导出性能 | 2026-07-06 |
+| 重新生成 Diff 由前端实时计算 | 后端不存储 Diff 数据，减少存储和状态管理复杂度 | 2026-07-06 |
+| 简单模式分章节生成（大纲先行+逐章节流式） | 避免一次性生成长内容 LLM 质量不稳定 | 2026-07-06 |
+| 中等模式对话质量不宜用硬指标判断，应通过 Prompt 约束让 LLM 自主判断，辅以代码层兜底 | LLM 对"是否该进入下一话题"的判断不可靠，需要逐轮优化 Prompt 约束 + 3 轮上限兜底 | 2026-07-06 |
+| 中等模式采用 7 话题逐轮引导，每话题 2-3 轮，LLM 判断信息充分后推进 | 避免 LLM 纠结一个话题或过早结束，代码层 3 轮强制推进 | 2026-07-06 |
+| 参考 prd-skeleton.md 将输出模板从 6 节扩展为 9 节 | 9 节模板更专业（Overview/Background/Stories/Requirements/Design/Technical/Rollout/Questions/Appendix） | 2026-07-06 |

@@ -6,6 +6,7 @@ from routers.ai_measure import ai_measure_bp
 from routers.chat import chat_bp
 from routers.kb_manage import kb_manage_bp
 from routers.code_analyze import code_analyze_bp
+from routers.prd_gen import prd_gen_bp
 from services.auth_middleware import auth_bp, get_llm_config
 from services.db import init_db, get_db, get_user_config
 
@@ -55,6 +56,7 @@ app.register_blueprint(ai_measure_bp, url_prefix='/api/ai-measure')
 app.register_blueprint(chat_bp, url_prefix='/api/chat')
 app.register_blueprint(kb_manage_bp, url_prefix='/api/kb-manage')
 app.register_blueprint(code_analyze_bp, url_prefix='/api/code-analyze')
+app.register_blueprint(prd_gen_bp)  # prd_gen_bp 自带 url_prefix=/api/prd
 app.register_blueprint(auth_bp)  # auth_bp 自带 /api/auth/verify
 
 

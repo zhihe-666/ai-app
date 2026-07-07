@@ -215,15 +215,7 @@ class CodeAnalyzeService:
             raise RuntimeError(f"target worktree checkout failed: {r2.stderr}")
 
     def _ensure_knowledge_snapshot(self):
-        if os.path.exists(self.snapshot_path):
-            try:
-                with open(self.snapshot_path) as f:
-                    snapshot = json.load(f)
-                generated_at = datetime.fromisoformat(snapshot["generatedAt"])
-                if (datetime.now() - generated_at).days < 3:
-                    return
-            except (json.JSONDecodeError, KeyError, ValueError):
-                pass
+        """每次分析都重新生成知识快照（5-15s，零 token 消耗）。"""
         self._generate_snapshot()
 
     def _generate_snapshot(self):
@@ -382,7 +374,13 @@ class CodeAnalyzeService:
             import concurrent.futures
 
             # Single comprehensive prompt per group (not two-step)
-            group_prompt = """你是 Algorithm Monorepo 项目的代码变更分析师。项目是机器学习模型训练与管理平台。
+            # Format knowledge snapshot as compact context string
+            snapshot_context = self._format_snapshot_context(snapshot)
+            group_prompt = f"""你是 Algorithm Monorepo 项目的代码变更分析师。项目是机器学习模型训练与管理平台。
+
+## 项目背景（知识快照）
+
+{snapshot_context}
 
 请为以下**一个**代码变更 Feature Group 生成业务描述。
 
@@ -394,22 +392,18 @@ class CodeAnalyzeService:
 - file_content: 变更后版本的文件内容（含行号，供参考上下文）
 
 **输出格式：** 仅输出一个 JSON 对象，不要包含其他内容：
-{
+{{
   "category": "10字以内概括，如"PS服务类型支持"、"队列选择优化"，以"新增"/"修改"/"下线"/"调整"等动词开头",
-  "description": "详细描述（100-200字），在{文件}中做了什么、为什么、具体字段名/状态码",
-  "type": "NEW_FEATURE | FEATURE_MODIFY | STYLE_ONLY | ..."
-}
-
-**type 修正规则：**
-1. type 默认等于输入中的 AST type，先判断是否合理
-2. 有明确证据时才修正。STYLE_ONLY→FEATURE_MODIFY 允许（如通过样式实现权限控制）
-3. 禁止 STYLE_ONLY→NEW_FEATURE。禁止随意提升级别。
-4. 如果 category 以"新增"或"新建"开头，type 必须为 NEW_FEATURE，不可归入其他类别
+  "description": "精炼的业务描述（50-100字），说明做了什么、为什么。**不要包含文件路径和代码定义**，用自然语言表达。"
+}}
 
 **描述规则：**
-1. 必须提及具体字段名、状态码、文件名
-2. 禁止"优化了代码"、"完善了功能"等模糊词汇
-3. 如果是 STYLE_ONLY/UI 类，简要描述样式或交互变更即可"""
+1. 只描述业务功能，**不要包含文件路径、文件名、目录结构**
+2. **不要包含代码中的变量名、函数名、参数名**等代码定义，用自然语言表达。如"首批次最大暂停秒数"而不是"首批次最大暂停秒数（resolveMaxFirstBatchPauseSeconds）"
+3. 字数控制在 50-100 字
+4. 语句要通顺完整，不能以"在"或"在...中"开头
+5. 禁止"优化了代码"、"完善了功能"等模糊词汇
+6. 如果是 STYLE_ONLY/UI 类，简要描述样式或交互变更即可"""
 
             feature_groups = ast_result.get("featureGroups", [])
             print(f"[CodeAnalyze] Per-group LLM call: {len(feature_groups)} groups")
@@ -467,82 +461,78 @@ class CodeAnalyzeService:
                             result = json.loads(match.group()) if match else {}
                         category = result.get("category") or ""
                         description = result.get("description") or category
-                        llm_type = result.get("type") or fg.get("type", "UNKNOWN")
-
-                        # Code-level override: category starts with 新增/新建 → NEW_FEATURE
-                        if category.startswith("新增") or category.startswith("新建"):
-                            llm_type = "NEW_FEATURE"
-                        elif category.startswith("移除") or category.startswith("删除"):
-                            llm_type = "FEATURE_REMOVAL"
 
                         return {
                             "category": category,
                             "description": description,
-                            "type": llm_type,
                         }
                     except (json.JSONDecodeError, Exception) as e:
                         if attempt == 0:
                             continue
                         # Fallback: use file name as category
                         fallback_name = files[0].split('/')[-1].replace('.tsx', '').replace('.ts', '') if files else "未知"
-                        return {"category": fallback_name, "description": str(e), "type": fg.get("type", "UNKNOWN")}
+                        return {"category": fallback_name, "description": str(e)}
 
             # Run per-group LLM calls in parallel
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 futures = [executor.submit(describe_group, fg) for fg in feature_groups]
                 results = [f.result(timeout=120) for f in futures]
 
-            # Build output from AST categories + LLM descriptions
-            new_features = []
-            modified_features = []
+            # 第一步：分类（不合并，先按 type 分到各个类别）
+            functional_changes = []
             removed_features = []
             ui_updates = []
 
             for fg, desc_result in zip(feature_groups, results):
-                # Use LLM's type if provided, fallback to AST type
-                gtype = desc_result.get("type") or fg.get("type", "UNKNOWN")
-                confidence = fg.get("confidence", 0.5)
-                files = [f.get("path") if isinstance(f, dict) else f for f in (fg.get("files") or [])]
+                # LLM 修正 type：category 以"新增"开头 → NEW_FEATURE
+                ast_type = fg.get("type", "UNKNOWN")
                 name = desc_result.get("category") or ""
                 desc = desc_result.get("description") or ""
-
-                # If LLM returned empty category, use file-based fallback name
                 if not name:
-                    name = files[0].split('/')[-1].replace('.tsx', '').replace('.ts', '') if files else "未知变更"
+                    files_list = [f.get("path") if isinstance(f, dict) else f for f in (fg.get("files") or [])]
+                    name = files_list[0].split('/')[-1].replace('.tsx', '').replace('.ts', '') if files_list else "未知变更"
 
-                if gtype in ("NEW_FEATURE",):
-                    new_features.append({
-                        "name": name,
-                        "description": desc,
-                        "confidence": float(confidence),
-                        "evidence_files": files,
-                        "user_visible": True,
-                    })
-                elif gtype in ("FEATURE_MODIFY", "INFRA_CHANGE", "UI_INTERACTION"):
-                    modified_features.append({
-                        "name": name,
-                        "description": desc,
-                        "confidence": float(confidence),
-                        "evidence_files": files,
-                        "user_visible": False,
-                    })
-                elif gtype in ("FEATURE_REMOVAL",):
-                    removed_features.append({
-                        "name": name,
-                        "description": desc,
-                        "evidence_files": files,
-                    })
+                if name.startswith("新增") or name.startswith("新建"):
+                    gtype = "NEW_FEATURE"
+                elif name.startswith("移除") or name.startswith("删除"):
+                    gtype = "FEATURE_REMOVAL"
+                # 代码层兜底：AST type 为 FEATURE_REMOVAL 且文件全部是删除状态，强制归入下线
+                elif ast_type == "FEATURE_REMOVAL":
+                    gtype = "FEATURE_REMOVAL"
                 else:
-                    # STYLE_ONLY, UNKNOWN → UI updates
+                    gtype = ast_type
+
+                confidence = fg.get("confidence", 0.5)
+                files = [f.get("path") if isinstance(f, dict) else f for f in (fg.get("files") or [])]
+
+                item = {
+                    "name": name,
+                    "description": desc,
+                    "confidence": float(confidence),
+                    "evidence_files": files,
+                    "user_visible": True,
+                }
+
+                if gtype in ("NEW_FEATURE", "FEATURE_MODIFY", "INFRA_CHANGE", "UI_INTERACTION", "TEXT_CHANGE", "TYPE_CHANGE"):
+                    functional_changes.append(item)
+                elif gtype in ("FEATURE_REMOVAL",):
+                    removed_features.append(item)
+                else:
+                    # 只有 STYLE_ONLY 和 UNKNOWN 归为 UI
                     ui_updates.append(name or f"{gtype} - {files[0].split('/')[-1] if files else 'unknown'}")
 
+            # 第二步：三大类各自合并去重
+            print(f"[CodeAnalyze] 合并前: functional={len(functional_changes)}, removed={len(removed_features)}, ui={len(ui_updates)}")
+            functional_changes = self._merge_similar_items(functional_changes, "functional", client)
+            removed_features = self._merge_similar_items(removed_features, "removed", client)
+            print(f"[CodeAnalyze] 合并后: functional={len(functional_changes)}, removed={len(removed_features)}")
+
             llm_result = {
-                "new_features": new_features,
-                "modified_features": modified_features,
+                "functional_changes": functional_changes,
                 "removed_features": removed_features,
                 "ui_updates": ui_updates,
                 "summary": {
-                    "functional_changes": len(new_features) + len(modified_features) + len(removed_features),
+                    "functional_changes": len(functional_changes) + len(removed_features),
                     "ui_changes": len(ui_updates),
                     "analyzed_files": ast_result.get("summary", {}).get("totalChangedFiles", 0),
                     "feature_groups": len(feature_groups),
@@ -563,8 +553,7 @@ class CodeAnalyzeService:
 
     def _build_rule_based_result(self, ast_result: dict) -> dict:
         groups = ast_result.get("featureGroups", [])
-        new_features = []
-        modified = []
+        functional = []
         removed_list = []
         ui_updates = []
 
@@ -572,33 +561,170 @@ class CodeAnalyzeService:
             gtype = g.get("type", "UNKNOWN")
             files = g.get("files", [])
             evidence = [f.get("path", f) if isinstance(f, dict) else f for f in files]
-            signals = g.get("allSignals", [])
 
-            # Build a descriptive name from signals + file count
             file_names = [ef.split('/')[-1] for ef in evidence[:3]]
             name = f"{gtype} - {', '.join(file_names)}"
 
-            if gtype in ("NEW_FEATURE",):
-                new_features.append({"name": name, "evidence_files": evidence, "confidence": 0.5})
-            elif gtype in ("FEATURE_MODIFY",):
-                modified.append({"name": name, "evidence_files": evidence, "confidence": 0.5})
+            if gtype in ("NEW_FEATURE", "FEATURE_MODIFY", "INFRA_CHANGE", "UI_INTERACTION", "TEXT_CHANGE", "TYPE_CHANGE"):
+                functional.append({"name": name, "evidence_files": evidence, "confidence": 0.5})
             elif gtype in ("FEATURE_REMOVAL",):
                 removed_list.append({"name": name, "evidence_files": evidence, "description": ""})
             else:
                 ui_updates.append(name)
 
         return {
-            "new_features": new_features,
-            "modified_features": modified,
+            "functional_changes": functional,
             "removed_features": removed_list,
             "ui_updates": ui_updates,
             "summary": {
-                "functional_changes": len(new_features) + len(modified) + len(removed_list),
+                "functional_changes": len(functional) + len(removed_list),
                 "ui_changes": len(ui_updates),
                 "analyzed_files": ast_result.get("summary", {}).get("totalChangedFiles", 0),
                 "feature_groups": len(groups),
             },
         }
+
+
+    def _format_snapshot_context(self, snapshot: dict) -> str:
+        """Format knowledge snapshot as compact string for LLM prompt injection."""
+        if not snapshot:
+            return "（无项目上下文）"
+
+        parts = []
+        apps = snapshot.get("applications", [])
+        for app in apps:
+            name = app.get("name", "unknown")
+            role = app.get("role", "")
+            routes = app.get("routes", [])
+            modules = app.get("modules", [])
+            api_modules = app.get("apiModules", [])
+
+            lines = [f"- 应用: {name} ({role})"]
+            if routes:
+                route_paths = [r.get("path", "") for r in routes if r.get("path")]
+                lines.append(f"  路由: {', '.join(route_paths[:8])}")
+                if len(route_paths) > 8:
+                    lines[-1] += f" 等共{len(route_paths)}条"
+            if modules:
+                lines.append(f"  页面模块: {', '.join(modules)}")
+            if api_modules:
+                api_summary = [f"{m['name']}({len(m.get('endpoints',[]))}接口)" for m in api_modules]
+                lines.append(f"  API 模块: {', '.join(api_summary)}")
+            parts.append('\n'.join(lines))
+
+        shared = snapshot.get("sharedPackages", [])
+        if shared:
+            sp_lines = []
+            for pkg in shared:
+                comps = pkg.get("components", [])
+                sp_lines.append(f"- 共享包 {pkg.get('name','')}: {', '.join(comps[:10])}{'等' if len(comps)>10 else ''}")
+            parts.append("共享包:\n" + '\n'.join(sp_lines))
+
+        return '\n\n'.join(parts)
+
+
+    def _merge_similar_items(self, items: list, category: str, client: LLMClient) -> list:
+        """语义去重：LLM 直接输出去重精简后的结果列表。
+
+        不依赖 LLM 选择"哪些合并"，而是要求 LLM 输出精简后的最终列表，
+        迫使 LLM 自行判断哪些该合并。
+        """
+        if len(items) <= 1:
+            return items
+
+        entries = []
+        for i, it in enumerate(items):
+            name = it.get("name", "")
+            desc = it.get("description", "")
+            entries.append(f"{i+1}. {name} — {desc}")
+
+        prompt = f"""以下是一次代码迭代中提取出的{len(entries)}个变更条目，其中有大量重复或高度相似的条目。
+
+输入条目：
+{chr(10).join(entries)}
+
+请将这些条目**去重合并**为一份精简列表。输出严格 JSON（只输出 JSON 对象，不要其他内容）：
+
+{{
+  "items": [
+    {{"name": "10字以内概括，动词开头", "description": "精炼描述（50-100字），说明做了什么"}}
+  ]
+}}
+
+规则：
+- 含义完全相同或高度相似的条目必须合并为一条
+- 合并后的 description 整合多条的核心信息，50-100 字，用自然语言表达，不要包含代码定义
+- 合并后如果还有多个条目，就输出多个
+- items 数组的长度必须少于或等于输入条目的数量
+- 不要原文照搬输入，要主动合并精简"""
+        try:
+            resp = client.chat(system=prompt, user="", temperature=0.0, max_tokens=4096, seed=42)
+            print(f"[CodeAnalyze] 合并响应前200字: {resp[:200]}")
+            result = json.loads(resp)
+            if not isinstance(result, dict):
+                match = re.search(r'\[.*\]', resp, re.DOTALL)
+                result = json.loads('[{"items":' + resp + '}]') if resp.startswith('[') else {}
+            merged_list = result.get("items", [])
+
+            if not merged_list:
+                return items
+
+            # 映射回原始 item 的元数据
+            merged = []
+            for merged_item in merged_list:
+                merged_name = merged_item.get("name", "")
+                merged_desc = merged_item.get("description", "")
+
+                # 找原始 items 中名称最匹配的作为元数据基础
+                best_match = items[0]
+                best_score = 0
+                for orig in items:
+                    orig_name = orig.get("name", "")
+                    # 简单前缀匹配
+                    if merged_name and orig_name and merged_name[:4] == orig_name[:4]:
+                        score = len(set(merged_name) & set(orig_name))
+                        if score > best_score:
+                            best_score = score
+                            best_match = orig
+
+                # 收集所有匹配原条目的 evidence_files 和 confidence
+                all_files = list(best_match.get("evidence_files", []))
+                max_conf = float(best_match.get("confidence", 0.5))
+                for orig in items:
+                    orig_name = orig.get("name", "")
+                    if merged_name and orig_name and (merged_name[:4] == orig_name[:4] or orig_name[:4] in merged_name):
+                        all_files.extend(orig.get("evidence_files", []))
+                        try:
+                            max_conf = max(max_conf, float(orig.get("confidence", 0)))
+                        except (ValueError, TypeError):
+                            pass
+
+                # 去重 files
+                seen_f = set()
+                deduped_files = []
+                for f in all_files:
+                    if f not in seen_f:
+                        seen_f.add(f)
+                        deduped_files.append(f)
+
+                merged.append({
+                    "name": merged_name,
+                    "description": merged_desc or best_match.get("description", ""),
+                    "confidence": max_conf,
+                    "evidence_files": deduped_files,
+                    "user_visible": best_match.get("user_visible", True),
+                })
+
+            if len(merged) < len(items):
+                print(f"[CodeAnalyze] LLM合并: {len(items)} → {len(merged)} 条")
+                return merged
+
+            print(f"[CodeAnalyze] LLM 未合并，保留 {len(items)} 条")
+            return items
+
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"[CodeAnalyze] 语义合并失败 ({category}): {e}")
+            return items
 
 
     def _get_all_frontend_paths(self) -> list[str]:

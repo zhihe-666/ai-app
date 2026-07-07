@@ -24,11 +24,11 @@ const activeNavItems = [
   { key: '/chat', icon: <WechatOutlined />, label: '知识库问答' },
   { key: '/kb-manage', icon: <DatabaseOutlined />, label: '知识库管理' },
   { key: '/code-analyze', icon: <CodeOutlined />, label: '功能变更分析' },
+  { key: '/prd-gen', icon: <EditOutlined />, label: 'PRD 智能生成' },
 ]
 
 const comingSoonItems = [
   { key: '/req-agent', icon: <ApartmentOutlined />, label: '需求理解 Agent' },
-  { key: '/prd-gen', icon: <EditOutlined />, label: 'PRD / 原型生成' },
   { key: '/weekly-rpt', icon: <FormOutlined />, label: '周报自动生成' },
 ]
 

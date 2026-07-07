@@ -301,7 +301,7 @@ export default function CodeAnalyze() {
           )}
 
           {/* Export buttons */}
-          {result.new_features && result.new_features.length > 0 && (
+          {result.functional_changes && result.functional_changes.length > 0 && (
             <Space style={{ marginBottom: 16 }}>
               <Button icon={<FileTextOutlined />} onClick={() => exportMarkdown(result)}>
                 导出 Markdown
@@ -319,48 +319,18 @@ export default function CodeAnalyze() {
             </Space>
           )}
 
-          {/* New Features */}
-          {result.new_features && result.new_features.length > 0 && (
+          {/* Functional Changes */}
+          {result.functional_changes && result.functional_changes.length > 0 && (
             <div style={{ marginBottom: 16 }}>
               <Text strong style={{ fontSize: 15 }}>
-                <Tag color="green">🆕 新增功能 ({result.new_features.length})</Tag>
+                <Tag color="blue">📦 功能变更 ({result.functional_changes.length})</Tag>
               </Text>
-              {result.new_features.map((f, i) => (
-                <Card key={i} size="small" style={{ marginTop: 8, background: '#f6ffed' }}>
+              {result.functional_changes.map((f, i) => (
+                <Card key={i} size="small" style={{ marginTop: 8, background: '#f0f5ff' }}>
                   <Space>
                     <Text strong>{f.name}</Text>
                     {f.confidence && <Tag>conf: {f.confidence.toFixed(2)}</Tag>}
                     {f.user_visible && <Tag color="blue">用户可见</Tag>}
-                  </Space>
-                  {f.description && <Paragraph style={{ marginTop: 6, marginBottom: 4 }}>{f.description}</Paragraph>}
-                  {f.evidence_files && f.evidence_files.length > 0 && (
-                    <Space wrap>
-                      {f.evidence_files.map((file, j) => (
-                        <Tooltip key={j} title={file}>
-                          <Tag style={{ maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', fontSize: 11 }}>
-                            {file.split('/').pop()}
-                          </Tag>
-                        </Tooltip>
-                      ))}
-                    </Space>
-                  )}
-                </Card>
-              ))}
-            </div>
-          )}
-
-          {/* Modified Features */}
-          {result.modified_features && result.modified_features.length > 0 && (
-            <div style={{ marginBottom: 16 }}>
-              <Text strong style={{ fontSize: 15 }}>
-                <Tag color="orange">🔄 功能修改 ({result.modified_features.length})</Tag>
-              </Text>
-              {result.modified_features.map((f, i) => (
-                <Card key={i} size="small" style={{ marginTop: 8, background: '#fffbe6' }}>
-                  <Space>
-                    <Text strong>{f.name}</Text>
-                    {f.confidence && <Tag>conf: {f.confidence.toFixed(2)}</Tag>}
-                    {f.user_visible === false && <Tag color="default">用户不可见</Tag>}
                   </Space>
                   {f.description && <Paragraph style={{ marginTop: 6, marginBottom: 4 }}>{f.description}</Paragraph>}
                   {f.evidence_files && f.evidence_files.length > 0 && (
@@ -409,8 +379,7 @@ export default function CodeAnalyze() {
           )}
 
           {/* Empty state */}
-          {(!result.new_features || result.new_features.length === 0) &&
-           (!result.modified_features || result.modified_features.length === 0) &&
+          {(!result.functional_changes || result.functional_changes.length === 0) &&
            (!result.removed_features || result.removed_features.length === 0) &&
            (!result.ui_updates || result.ui_updates.length === 0) && (
             <Empty description="未检测到有效变更" />

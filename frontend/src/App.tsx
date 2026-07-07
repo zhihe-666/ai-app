@@ -6,6 +6,7 @@ import AiMeasure from './pages/AiMeasure'
 import KbManage from './pages/KbManage'
 import Chat from './pages/Chat'
 import CodeAnalyze from './pages/CodeAnalyze'
+import PrdGen from './pages/PrdGen'
 
 function App() {
   return (
@@ -18,6 +19,7 @@ function App() {
         <Route path="/kb-manage" element={<KbManage />} />
         <Route path="/chat" element={<Chat />} />
         <Route path="/code-analyze" element={<CodeAnalyze />} />
+        <Route path="/prd-gen" element={<PrdGen />} />
       </Route>
     </Routes>
   )

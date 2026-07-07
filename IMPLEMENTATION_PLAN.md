@@ -730,3 +730,46 @@ frontend/
 | 信号提取器全用正则 | **正则提取 + astValidator.ts AST 验证**双层分离 | 正则召回率高但假阳性多，AST 精确率高但复杂；两层各司其职 |
 | LLM 输出仅 {category, description} | **LLM 输出 {category, description, type}**，可修正 AST 分类 | LLM 比代码更懂业务意图（如 CSS 隐藏本质是权限控制） |
 | ts-morph 轻量模式 | 不变，保持 skipFileDependencyResolution=true | 无需 TypeChecker，节省 2-5 分钟加载时间 |
+
+---
+
+### Phase 5: PRD 智能生成系统 MVP
+
+#### 实际实现差异（2026-07-06）
+
+| 原始方案（MVP 文档） | 实际实现 | 原因 |
+|---------|---------|------|
+| FastAPI Web 框架 | **Flask Blueprint** | 与现有 AI 中控台技术栈一致，dclaw.yaml 类型为 flask-react |
+| Redis 状态管理 | **SQLite 全量存储**，新增 `prd_sessions`/`prd_chat_messages` 表 | 减少依赖，MVP 阶段无 Redis 需求 |
+| JSONB 字段 | **TEXT 存 JSON 字符串** | SQLite 不支持 JSONB |
+| Milkdown Markdown 编辑器 | **react-markdown + remark-gfm** | 复用现有组件，减少额外依赖 |
+| EventSource API | **复用 `utils/sse.ts`**（fetch + ReadableStream） | 已有成熟 SSE 解析器 |
+| 简单模式一次性输出 | **简单模式分章节生成**（大纲→逐章节 SSE 流式） | 避免长内容 LLM 质量不稳定 |
+| 并发生成章节 | **串行生成** | 避免同一会话状态竞态写入 |
+| 版本管理 + Diff 后端存储 | **保留最近 3 版 + 前端实时计算 Diff** | 简化后端状态管理 |
+| 导出接口 POST | **GET**（Content-Disposition: attachment） | 符合 REST 规范，浏览器直接下载 |
+| 自研 LLM 适配器 | **复用 `llm_client.py` + `LLMConfigProvider`** | 已有 API Key/Base URL/Model 三件套管理 |
+| 独立妙记 API 对接 | **复用 `feishu_client.py` + `meeting_todo_service.py`** | lark-cli subprocess 已有完整妙记流程 |
+| LangGraph 编排 | **Flask 同步状态机，由前端管理流式回调** | MVP 无需复杂状态图 |
+
+#### 关键设计决策
+
+1. **`prd_sessions.section_contents` TEXT 字段**：存储所有章节内容 JSON，替代每次从版本表读取，提升编辑/导出性能
+2. **`update_prd_session` 自动 JSON 序列化**：`collected_info`/`minutes_extract`/`outline`/`section_contents` 传 dict/list 时自动 `json.dumps`
+3. **`react-diff-viewer-continued`**：使用社区维护版替代原 `react-diff-viewer`（后者已不再更新）
+4. **Section 生成按钮智能禁用**：生成中只禁用当前章节按钮，其他章节仍可查看
+
+#### 文件清单
+
+| 文件 | 说明 |
+|------|------|
+| `backend/services/db.py` | 新增 4 张表（prd_sessions / prd_versions / prd_files / prd_chat_messages）+ 14 个 CRUD 函数 |
+| `backend/services/llm_client.py` | 新增 `chat_stream()` 流式方法 |
+| `backend/services/prd_gen_service.py` | PRDGenService 核心类：会话管理、Prompt 模板、简单/中等模式、完备度检查、版本管理、妙记解析、文件上传、导出 |
+| `backend/services/project_context.md` | 平台架构快照默认模板（已废弃 2026-07-06） |
+| `backend/routers/prd_gen.py` | 13 个 API 端点（sessions/simple-generate/chat/completeness/outline/sections/versions/export/files/minutes） |
+| `backend/app.py` | 注册 `prd_gen_bp` Blueprint |
+| `frontend/src/api/prdGen.ts` | 13 个 API 函数 + 完整 TypeScript 类型 |
+| `frontend/src/pages/PrdGen.tsx` | 完整 PRD 工作台页面（步骤条+输入区+Q&A+大纲+编辑器+Diff+版本管理） |
+| `frontend/src/App.tsx` | 注册 `/prd-gen` 路由 |
+| `frontend/src/components/AppLayout.tsx` | 侧边栏从 comingSoon 移到 activeNav |

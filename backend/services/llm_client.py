@@ -84,3 +84,39 @@ class LLMClient:
             kwargs["seed"] = seed
         resp = self.client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
+
+    def chat_stream(
+        self,
+        system: str,
+        user: str,
+        temperature: float = 0.3,
+        max_tokens: int = 4096,
+    ):
+        """流式 Chat 调用，逐 chunk yield 内容
+
+        用于 SSE 流式场景，前端逐字展示生成内容。
+
+        Args:
+            system: System prompt
+            user: User message
+            temperature: 温度参数，默认 0.3
+            max_tokens: 最大输出 token 数
+
+        Yields:
+            逐 token 内容字符串
+        """
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        for chunk in resp:
+            if chunk.choices and len(chunk.choices) > 0:
+                delta = chunk.choices[0].delta
+                if delta and delta.content:
+                    yield delta.content

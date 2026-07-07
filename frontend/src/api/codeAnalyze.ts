@@ -23,14 +23,7 @@ export interface AnalysisResult {
     functional_changes?: number
     ui_changes?: number
   }
-  new_features?: Array<{
-    name: string
-    confidence: number
-    evidence_files: string[]
-    description: string
-    user_visible?: boolean
-  }>
-  modified_features?: Array<{
+  functional_changes?: Array<{
     name: string
     confidence: number
     evidence_files: string[]

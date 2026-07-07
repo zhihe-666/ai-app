@@ -970,3 +970,102 @@ Phase 7 全部功能已稳定：
 | 稳定性 | seed=42 + temperature=0.0 + 逐组调用（1:1 对齐） |
 | 导出 | Markdown 下载 + 飞书文档 |
 | 多仓库 | 可编辑 URL/分支，SQLite 缓存配置 |
+
+---
+
+## Episode 27: PRD 智能生成系统 MVP — 塑料焊工的一次正经工程实践
+
+**时间：** 2026-07-06
+
+### 背景
+
+功能变更分析模块做完之后，下一个明确需求是"PRD 智能生成系统"。两篇文档已经写好了（完整方案和 MVP 方案），但完整方案有过度设计嫌疑（GraphRAG、JSON Schema 原型引擎），而 MVP 方案假设 FastAPI + Redis + Milkdown 等，与现有 Flask + SQLite + Ant Design 技术栈不一致。
+
+### 文档修改
+
+和之前几轮一样，先改文档再写代码。这次的主要改动：
+
+| 文档 | 改动项 |
+|------|--------|
+| 完整方案 | FastAPI→Flask、PostgreSQL→SQLite、模型层命名修正（pro/flash 互转）、LLM 适配器复用标注、飞书妙记复用标注、前端技术栈适配 |
+| MVP 方案 | FastAPI→Flask、Redis→SQLite 全量存储、JSONB→TEXT、并发生成→串行、版本管理简化（3 版）、简单模式分章节生成、导出接口 GET、复用现有代码标注、Prompt 防重复约束、API 路径统一 `/api/prd/*` |
+
+### 7 个 Phase 的实现
+
+#### Phase 1: 数据库扩展
+
+4 张表全部用 TEXT 存 JSON，SQLite 不支持 JSONB，`collected_info`、`minutes_extract`、`outline`、`section_contents` 全部用 Python `json.loads/dumps` 处理。
+
+最意外的是测试时发现 `get_db()` 依赖 Flask 的 `g` 对象，直接在命令行跑会报 `RuntimeError: Working outside of application context`。最后用原生 sqlite3 写 SQL 验证。
+
+#### Phase 2: LLM 流式
+
+`chat_stream()` 方法只有 20 行，但它是后面所有 SSE 流式生成的基础。`stream=True` 逐 token yield，前端用 ReactMarkdown 实时渲染。
+
+#### Phase 3: 核心服务
+
+`PRDGenService` 是这一轮最大的文件。主要逻辑：
+
+- **简单模式**：大纲 → 逐章节流式生成，每章节完发送 `section_complete` 事件
+- **中等模式**：问答轮次 → LLM 提取结构化信息到 `collected_info` → 完备度检查（6 项核心信息，前 5 项必填，≥80% 达标）→ 大纲 → 章节生成
+- **版本管理**：`save_prd_version` 自动保存快照 + `cleanup_old_versions` 保留最近 3 版
+- **妙记解析**：复用 `feishu_client.get_minute_info()` + `get_transcript()`
+- **JSON 解析**：4 层递进容错（同 meeting_todo_service 的既存模式）
+
+#### Phase 4-5: 路由 + 前端 API
+
+13 个端点，统一注册 `/api/prd/*`。前端 `prdGen.ts` 含 13 个 API 函数（SSE 复用 `streamRequest`，导出用 `window.open` 触发 GET 下载）。
+
+#### Phase 6: 前端页面
+
+`PrdGen.tsx` 是最大的前端文件。布局：
+
+```
+步骤条（4 步）→ 输入区（文字/妙记/文件 Tab）
+→ Q&A 区（中等模式，含 Progress 进度条）
+→ 大纲区（章节按钮 + 状态标签）
+→ 编辑器（Markdown 渲染 + 编辑切换 + Diff 对比 + 版本管理）
+```
+
+覆盖了 loading、empty、error、streaming 四种状态。
+
+#### Phase 7: 路由集成
+
+从 comingSoon 移到 activeNav，用户即点即用。
+
+### 一些技术细节
+
+- **`section_contents` 字段**：session 表里的 TEXT 字段存所有章节内容，替代每次从版本表读取，编辑和导出时省去了一次查询
+- **`update_prd_session` 自动 JSON 序列化**：四个 JSON 字段传 dict/list 时自动 `json.dumps`，调用方不用管序列化
+- **Diff 前端计算**：重新生成时后端只返回新内容，前端用 `react-diff-viewer-continued` 实时对比新旧内容，后端不存 Diff 数据
+- **生成按钮智能禁用**：生成中只禁用当前章节按钮，其他章节仍可查看，不会阻塞用户体验
+
+### 涉及文件
+
+```
+backend/services/db.py              — 4 表 + 14 CRUD
+backend/services/llm_client.py       — chat_stream()
+backend/services/prd_gen_service.py  — 新建（核心服务）
+backend/services/project_context.md  — 新建（平台快照）
+backend/routers/prd_gen.py           — 新建（13 端点）
+backend/app.py                       — 注册 blueprint
+frontend/src/api/prdGen.ts           — 新建
+frontend/src/pages/PrdGen.tsx        — 新建
+frontend/src/App.tsx                 — 路由
+frontend/src/components/AppLayout.tsx — 侧边栏
+```
+
+### 迭代：中等模式对话质量优化
+
+MVP 实现后，中等模式对话轮次经历了 4 轮迭代：
+
+| 轮次 | 方案 | 问题 |
+|------|------|------|
+| 1 | 将用户回答填入 6 个固定字段 + 硬指标检查完备度 | LLM 幻觉填充所有字段，1 轮就 100% |
+| 2 | LLM 基于对话历史判断完备度 + 代码层不满 4 轮强制继续 | LLM 判断太宽松，2 轮就说够了 |
+| 3 | 7 个话题逐轮引导，LLM 判断是否进入下一话题 | 纠结一个话题反复问、问无关问题（战略对齐等）、多轮后遗忘重复 |
+| 4 | 参考 `prd-skeleton.md` 重构输出模板为 9 节，优化 Prompt 约束体系 | 仍在迭代中 |
+
+**核心教训**：LLM 不适合做"是否该进入下一话题"的精确判断，但也不能一刀切限制。需要更精细的 Prompt 约束 + 代码层安全兜底。
+
+**当前状态**：PRD 模块阶段性完成，切换回前端代码优化。

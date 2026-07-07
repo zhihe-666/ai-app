@@ -81,6 +81,66 @@ def init_db():
                 PRIMARY KEY (repo_url, branch, start_time, end_time)
             )
         ''')
+
+        # ── PRD 智能生成系统 — 4 张表 ──
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS prd_sessions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL DEFAULT '',
+                mode TEXT NOT NULL DEFAULT 'simple',
+                status TEXT NOT NULL DEFAULT 'init',
+                user_input TEXT NOT NULL DEFAULT '',
+                collected_info TEXT NOT NULL DEFAULT '{}',
+                minutes_extract TEXT NOT NULL DEFAULT '{}',
+                current_round INTEGER NOT NULL DEFAULT 0,
+                completeness REAL NOT NULL DEFAULT 0.0,
+                outline TEXT NOT NULL DEFAULT '[]',
+                section_contents TEXT NOT NULL DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS prd_versions (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                section TEXT NOT NULL,
+                content TEXT NOT NULL DEFAULT '',
+                version_num INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS prd_files (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                filename TEXT NOT NULL DEFAULT '',
+                file_type TEXT NOT NULL DEFAULT 'temporary',
+                storage_path TEXT NOT NULL DEFAULT '',
+                text_content TEXT NOT NULL DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS prd_chat_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'system',
+                content TEXT NOT NULL DEFAULT '',
+                round INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_prd_versions_session
+            ON prd_versions (session_id, section, version_num)
+        ''')
+        conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_prd_messages_session
+            ON prd_chat_messages (session_id, round)
+        ''')
+
         conn.commit()
     finally:
         conn.close()
@@ -234,3 +294,215 @@ def get_commit_cache(repo_url: str, branch: str, start_time: str, end_time: str)
         (repo_url, branch, start_time, end_time)
     ).fetchone()
     return dict(row) if row else None
+
+
+# ── PRD 智能生成系统 — CRUD ──
+
+import uuid
+import json
+
+
+def _now() -> str:
+    """返回当前时间戳字符串"""
+    from datetime import datetime
+    return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+
+# ── prd_sessions ──
+
+
+def create_prd_session(mode: str, user_input: str) -> dict:
+    """创建 PRD 会话"""
+    session_id = str(uuid.uuid4())
+    conn = get_db()
+    conn.execute('''
+        INSERT INTO prd_sessions (id, mode, user_input, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (session_id, mode, user_input, _now(), _now()))
+    conn.commit()
+    return get_prd_session(session_id)
+
+
+def get_prd_session(session_id: str) -> dict | None:
+    """获取 PRD 会话"""
+    conn = get_db()
+    row = conn.execute('SELECT * FROM prd_sessions WHERE id = ?', (session_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def update_prd_session(session_id: str, **kwargs) -> dict | None:
+    """更新 PRD 会话字段
+
+    仅更新传入的 kwargs 中非空的字段。
+    collected_info / minutes_extract / outline / section_contents 自动 JSON 序列化。
+
+    Usage:
+        update_prd_session('xxx', status='writing', completeness=0.8)
+        update_prd_session('xxx', outline=json.dumps(sections))
+    """
+    if not kwargs:
+        return get_prd_session(session_id)
+
+    # JSON 序列化
+    for json_field in ('collected_info', 'minutes_extract', 'outline', 'section_contents'):
+        val = kwargs.get(json_field)
+        if val is not None and isinstance(val, (dict, list)):
+            kwargs[json_field] = json.dumps(val, ensure_ascii=False)
+
+    fields = ', '.join(f'{k} = ?' for k in kwargs)
+    values = list(kwargs.values())
+
+    conn = get_db()
+    conn.execute(
+        f'UPDATE prd_sessions SET {fields}, updated_at = ? WHERE id = ?',
+        (*values, _now(), session_id)
+    )
+    conn.commit()
+    return get_prd_session(session_id)
+
+
+# ── prd_versions ──
+
+
+def get_next_version_num(session_id: str, section: str) -> int:
+    """获取指定章节下一个版本号"""
+    conn = get_db()
+    row = conn.execute(
+        'SELECT COALESCE(MAX(version_num), 0) + 1 AS next_ver FROM prd_versions WHERE session_id = ? AND section = ?',
+        (session_id, section)
+    ).fetchone()
+    return row['next_ver'] if row else 1
+
+
+def save_prd_version(session_id: str, section: str, content: str) -> dict:
+    """保存章节版本快照
+
+    自动生成版本号并保留最近 3 个版本。
+    """
+    version_id = str(uuid.uuid4())
+    version_num = get_next_version_num(session_id, section)
+    conn = get_db()
+    conn.execute('''
+        INSERT INTO prd_versions (id, session_id, section, content, version_num, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (version_id, session_id, section, content, version_num, _now()))
+    conn.commit()
+
+    # 清理：只保留该章节最近 3 个版本
+    cleanup_old_versions(session_id, section, keep=3)
+
+    return {'id': version_id, 'version_num': version_num}
+
+
+def get_prd_versions(session_id: str, section: str | None = None) -> list[dict]:
+    """获取版本列表
+
+    Args:
+        session_id: 会话 ID
+        section: 可选，指定章节
+    """
+    conn = get_db()
+    if section:
+        rows = conn.execute(
+            'SELECT id, session_id, section, version_num, created_at FROM prd_versions '
+            'WHERE session_id = ? AND section = ? ORDER BY version_num DESC',
+            (session_id, section)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            'SELECT id, session_id, section, version_num, created_at FROM prd_versions '
+            'WHERE session_id = ? ORDER BY section, version_num DESC',
+            (session_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_prd_version_content(version_id: str) -> dict | None:
+    """获取指定版本的内容"""
+    conn = get_db()
+    row = conn.execute('SELECT * FROM prd_versions WHERE id = ?', (version_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def cleanup_old_versions(session_id: str, section: str, keep: int = 3):
+    """清理多余的旧版本
+
+    保留最近 keep 个版本，删除更旧的。
+    """
+    conn = get_db()
+    conn.execute('''
+        DELETE FROM prd_versions WHERE id IN (
+            SELECT id FROM prd_versions
+            WHERE session_id = ? AND section = ?
+            ORDER BY version_num DESC
+            LIMIT -1 OFFSET ?
+        )
+    ''', (session_id, section, keep))
+    conn.commit()
+
+
+# ── prd_files ──
+
+
+def save_prd_file(
+    file_id: str, session_id: str, filename: str,
+    file_type: str, storage_path: str, text_content: str,
+) -> dict:
+    """保存上传的文件记录"""
+    conn = get_db()
+    conn.execute('''
+        INSERT INTO prd_files (id, session_id, filename, file_type, storage_path, text_content, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (file_id, session_id, filename, file_type, storage_path, text_content, _now()))
+    conn.commit()
+    return {'id': file_id, 'filename': filename, 'file_type': file_type}
+
+
+def get_prd_files(session_id: str) -> list[dict]:
+    """获取会话关联的文件列表"""
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT id, filename, file_type, created_at FROM prd_files WHERE session_id = ? ORDER BY created_at DESC',
+        (session_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_prd_file(file_id: str) -> dict | None:
+    """获取单个文件详情"""
+    conn = get_db()
+    row = conn.execute('SELECT * FROM prd_files WHERE id = ?', (file_id,)).fetchone()
+    return dict(row) if row else None
+
+
+# ── prd_chat_messages ──
+
+
+def add_chat_message(session_id: str, role: str, content: str, round_num: int) -> dict:
+    """添加对话消息
+
+    Args:
+        session_id: 会话 ID
+        role: 'system' | 'user'
+        content: 消息内容
+        round_num: 对话轮次
+    """
+    msg_id = str(uuid.uuid4())
+    conn = get_db()
+    conn.execute('''
+        INSERT INTO prd_chat_messages (id, session_id, role, content, round, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (msg_id, session_id, role, content, round_num, _now()))
+    conn.commit()
+    return {'id': msg_id, 'role': role, 'round': round_num}
+
+
+def get_chat_messages(session_id: str) -> list[dict]:
+    """获取会话的对话历史（按轮次正序）"""
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT id, session_id, role, content, round, created_at FROM prd_chat_messages '
+        'WHERE session_id = ? ORDER BY round ASC, created_at ASC',
+        (session_id,)
+    ).fetchall()
+    return [dict(r) for r in rows]

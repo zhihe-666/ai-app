@@ -646,3 +646,122 @@ Console 输出 `completedRef: Array(3)` 缺 active_rate。根因: 手写 SSE 解
 - `tools/code-analyzer/src/graph/cluster.ts` — 新增 splitTextFileClusters + mergePageLogicClusters
 - `tools/code-analyzer/src/types.ts` — 新增 GENERIC_CHANGE / TEXT_CHANGE / TYPE_CHANGE / TEST_CHANGE + line 字段
 - `tools/code-analyzer/src/classify/decisionTree.ts` — 处理新信号类型
+
+---
+
+## 2026-07-06 · PRD 智能生成模块 — MVP 全流程实现
+
+### 前置准备
+- **文档更新**：`PRD智能生成系统方案.md` 和 `PRD智能生成系统 MVP 实施方案.md` 完成技术栈适配（FastAPI→Flask，PostgreSQL→SQLite，Milkdown→react-markdown，Redis→SQLite 全量存储，JSONB→TEXT）
+- **开发计划**：`PRD智能生成系统MVP开发计划.md` — 7 个 Phase，预计 5 天
+
+### Phase 1: 数据库扩展 — 4 张表
+- **prd_sessions** — 会话表（id, mode, status, user_input, collected_info TEXT, minutes_extract TEXT, outline TEXT, section_contents TEXT, completeness, current_round）
+- **prd_versions** — 版本表（id, session_id, section, content, version_num），保留最近 3 版
+- **prd_files** — 文件表（id, session_id, filename, file_type, storage_path, text_content）
+- **prd_chat_messages** — 对话消息表（id, session_id, role, content, round）
+- 全部使用 TEXT 类型存储 JSON 字符串，Python 层 `json.loads/dumps` 处理
+- 2 个索引：`idx_prd_versions_session`、`idx_prd_messages_session`
+- SQL 级别 CRUD 测试通过 ✅
+
+### Phase 2: LLM 流式支持
+- `llm_client.py` 新增 `chat_stream()` 方法，使用 `stream=True` 逐 token yield
+
+### Phase 3: 后端核心服务
+- `prd_gen_service.py` — `PRDGenService` 类
+- **会话管理**：create/get/update session
+- **简单模式**：大纲 → 逐章节 SSE 流式生成
+- **中等模式**：问答轮次 → LLM 提取结构化信息 → 完备度检查 → 大纲 → 章节生成
+- **信息完备度检查**：6 项核心信息，前 5 项必填，≥ 80% 达标
+- **版本管理**：`save_prd_version` 自动保存快照 + `cleanup_old_versions` 保留最近 3 版
+- **妙记解析**：复用 `feishu_client.get_minute_info()` + `get_transcript()`
+- **文件上传**：支持 .md/.txt/.docx，≤10MB，临时/长期分类
+- **导出**：按大纲顺序拼接完整 Markdown
+- **JSON 解析容错**：4 层递进容错（标准→清理→尾随逗号→截断修复）
+- `project_context.md` 默认模板创建
+
+### Phase 4: Flask Blueprint
+- `routers/prd_gen.py` — 13 个端点，统一注册 `/api/prd/*`
+- `app.py` — 注册 `prd_gen_bp`
+
+### Phase 5: 前端 API 层
+- `api/prdGen.ts` — 13 个 API 函数 + 完整 TypeScript 类型定义
+- SSE 接口复用 `streamRequest()`，导出接口用 `window.open()`
+
+### Phase 6: 前端页面
+- `pages/PrdGen.tsx` — 完整 PRD 生成工作台
+- 布局：步骤条（4 步）→ 输入区（文字/妙记/文件 Tab）→ Q&A 区（中等模式）→ 大纲→ 编辑器+Diff 对比
+- 覆盖 loading、empty、error、streaming 四种状态
+- 章节生成按钮智能禁用（只禁用当前生成中的章节）
+- Diff 对比使用 `react-diff-viewer-continued`
+- 版本管理 Modal 展示版本列表 + 恢复操作
+
+### Phase 7: 路由集成
+- `App.tsx` — 新增 `/prd-gen` 路由
+- `AppLayout.tsx` — 从 comingSoon 移到 activeNav
+
+### 中间方案调整
+- **`section_contents` 字段**：session 表新增 TEXT 字段存储章节内容，替代每次从版本表读取，提升编辑和导出性能
+- **`update_prd_session` 自动 JSON 序列化**：`collected_info`/`minutes_extract`/`outline`/`section_contents` 传 dict/list 时自动 json.dumps
+- **导出函数复用 outline 顺序**：按大纲章节顺序拼接，确保导出 PRD 结构正确
+- **`react-diff-viewer-continued`**：使用社区维护版替代原 `react-diff-viewer`
+
+### 涉及文件
+- `backend/services/db.py` — 新增 4 张表 + 14 个 CRUD 函数
+- `backend/services/llm_client.py` — 新增 `chat_stream()`
+- `backend/services/prd_gen_service.py` — 新建
+- `backend/services/project_context.md` — 新建
+- `backend/routers/prd_gen.py` — 新建
+- `backend/app.py` — 注册 blueprint
+- `frontend/src/api/prdGen.ts` — 新建
+- `frontend/src/pages/PrdGen.tsx` — 新建
+- `frontend/src/App.tsx` — 新增路由
+- `frontend/src/components/AppLayout.tsx` — 侧边栏
+
+### 中等模式对话优化迭代（2026-07-06 持续）
+- **参考方案**：参考 `prd-skeleton.md` 9 节模板，重构输出模板为 9 节
+- **对话引导**：7 个话题按顺序引导，LLM 逐轮判断是否完成
+- **Prompt 迭代**：多轮优化，核心约束：每轮一问、不问无关问题、避免重复、2-3 轮/话题、信息充分时推进
+- **代码层兜底**：同话题超过 3 轮强制推进
+- **用户确认闸口**：全部话题完成由用户确认是否开始生成
+- **当前状态**：核心流程就绪，对话质量持续迭代中
+- **涉及文件**：`prd_gen_service.py`、`prd_gen.py`、`PrdGen.tsx`、`prdGen.ts`
+
+---
+
+## 2026-07-06 · 代码变更分析优化
+
+### 变更内容
+1. **知识快照注入 LLM Prompt**（优先级 1）
+   -  将知识快照格式化为路由/模块/API 摘要
+   - 注入 ，LLM 现在能看到项目背景
+   - 涉及文件：
+
+2. **废弃 project_context.md**（优先级 3）
+   - 删除 
+   - 清除  中 、、 全部引用
+   -  直接返回模板字符串
+   - 涉及文件：、（已删除）
+
+3. **GitLab Token 记录**
+   - 保存到 
+
+
+---
+
+## 2026-07-06 · 代码变更分析优化
+
+### 变更内容
+1. **知识快照注入 LLM Prompt**（优先级 1）
+   - `_format_snapshot_context()` 将知识快照格式化为路由/模块/API 摘要
+   - 注入 `group_prompt`，LLM 现在能看到项目背景
+   - 涉及文件：`backend/services/code_analyze_service.py`
+
+2. **废弃 project_context.md**（优先级 3）
+   - 删除 `backend/services/project_context.md`
+   - 清除 `prd_gen_service.py` 中 `_PROJECT_CONTEXT_PATH`、`_load_project_context()`、`_project_context_cache` 全部引用
+   - `_build_system_prompt()` 直接返回模板字符串
+   - 涉及文件：`backend/services/prd_gen_service.py`、`backend/services/project_context.md`（已删除）
+
+3. **GitLab Token 记录**
+   - 保存到 `memory/gitlab-token.md`

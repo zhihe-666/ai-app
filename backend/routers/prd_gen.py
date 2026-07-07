@@ -114,6 +114,29 @@ def chat_round(id):
     return result
 
 
+# ── 3b. 重新讨论已完成话题 ──
+
+
+@prd_gen_bp.route('/sessions/<id>/rechat-topic', methods=['POST'])
+def rechat_topic(id):
+    """重新进入某个已完成的话题"""
+    cfg = _get_llm_config()
+    if not cfg['api_key']:
+        return {'error': '请先配置 LLM API Key'}, 400
+
+    data = request.get_json(silent=True) or {}
+    topic = data.get('topic', '')
+
+    if not topic:
+        return {'error': '请提供话题名称'}, 400
+
+    result = service.rechat_topic(id, topic, cfg['api_key'], cfg['base_url'], cfg['model'])
+    if 'error' in result:
+        return result, 404 if '不存在' in result.get('error', '') else 400
+
+    return result
+
+
 # ── 4. 查询完备度 ──
 
 

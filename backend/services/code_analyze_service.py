@@ -393,14 +393,22 @@ class CodeAnalyzeService:
 
 **输出格式：** 仅输出一个 JSON 对象，不要包含其他内容：
 {{
-  "category": "10字以内概括，如"PS服务类型支持"、"队列选择优化"，以"新增"/"修改"/"下线"/"调整"等动词开头",
-  "description": "精炼的业务描述（50-100字），说明做了什么、为什么。**不要包含文件路径和代码定义**，用自然语言表达。"
+  "category": "15字以内概括，如"PS服务类型支持"、"队列选择优化"，以"新增"/"修改"/"下线"/"调整"等动词开头",
+  "description": "精炼的业务描述（50-150字），说明做了什么、为什么。**不要包含文件路径和代码定义**，用自然语言表达。",
+  "type": "NEW_FEATURE | FEATURE_MODIFY | FEATURE_REMOVAL | STYLE_ONLY"
 }}
+
+**type 规则：**
+- type 默认等于输入中的 AST type，**不要随意修改**
+- 只有当你非常确信 AST 分类错误时才能修改 type
+- 如果 category 以"新增"开头，type 必须为 NEW_FEATURE
+- 如果 category 以"移除"开头，type 必须为 FEATURE_REMOVAL
+
 
 **描述规则：**
 1. 只描述业务功能，**不要包含文件路径、文件名、目录结构**
 2. **不要包含代码中的变量名、函数名、参数名**等代码定义，用自然语言表达。如"首批次最大暂停秒数"而不是"首批次最大暂停秒数（resolveMaxFirstBatchPauseSeconds）"
-3. 字数控制在 50-100 字
+3. 字数控制在 50-150 字
 4. 语句要通顺完整，不能以"在"或"在...中"开头
 5. 禁止"优化了代码"、"完善了功能"等模糊词汇
 6. 如果是 STYLE_ONLY/UI 类，简要描述样式或交互变更即可"""
@@ -461,17 +469,19 @@ class CodeAnalyzeService:
                             result = json.loads(match.group()) if match else {}
                         category = result.get("category") or ""
                         description = result.get("description") or category
+                        llm_type = result.get("type") or ""
 
                         return {
                             "category": category,
                             "description": description,
+                            "type": llm_type,
                         }
                     except (json.JSONDecodeError, Exception) as e:
                         if attempt == 0:
                             continue
                         # Fallback: use file name as category
                         fallback_name = files[0].split('/')[-1].replace('.tsx', '').replace('.ts', '') if files else "未知"
-                        return {"category": fallback_name, "description": str(e)}
+                        return {"category": fallback_name, "description": str(e), "type": ""}
 
             # Run per-group LLM calls in parallel
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
@@ -484,19 +494,27 @@ class CodeAnalyzeService:
             ui_updates = []
 
             for fg, desc_result in zip(feature_groups, results):
-                # LLM 修正 type：category 以"新增"开头 → NEW_FEATURE
+                # 分类优先级：LLM type > category 前缀 > AST type
                 ast_type = fg.get("type", "UNKNOWN")
+                llm_type = desc_result.get("type", "") or ""
                 name = desc_result.get("category") or ""
                 desc = desc_result.get("description") or ""
+
                 if not name:
                     files_list = [f.get("path") if isinstance(f, dict) else f for f in (fg.get("files") or [])]
                     name = files_list[0].split('/')[-1].replace('.tsx', '').replace('.ts', '') if files_list else "未知变更"
 
+                # 确定 gtype：category 前缀 > description 语义 > STYLE_ONLY 兜底 > LLM type > AST type
                 if name.startswith("新增") or name.startswith("新建"):
                     gtype = "NEW_FEATURE"
                 elif name.startswith("移除") or name.startswith("删除"):
                     gtype = "FEATURE_REMOVAL"
-                # 代码层兜底：AST type 为 FEATURE_REMOVAL 且文件全部是删除状态，强制归入下线
+                elif "样式" in name or "样式" in desc:
+                    gtype = "STYLE_ONLY"
+                elif ast_type == "STYLE_ONLY":
+                    gtype = "STYLE_ONLY"
+                elif llm_type in ("NEW_FEATURE", "FEATURE_MODIFY", "FEATURE_REMOVAL"):
+                    gtype = llm_type
                 elif ast_type == "FEATURE_REMOVAL":
                     gtype = "FEATURE_REMOVAL"
                 else:
@@ -521,11 +539,24 @@ class CodeAnalyzeService:
                     # 只有 STYLE_ONLY 和 UNKNOWN 归为 UI
                     ui_updates.append(name or f"{gtype} - {files[0].split('/')[-1] if files else 'unknown'}")
 
-            # 第二步：三大类各自合并去重
+            # 第二步：过滤与平台功能无关的条目（常量/枚举/代码重构等）
+            print(f"[CodeAnalyze] 过滤前: functional={len(functional_changes)}")
+            functional_changes = self._filter_non_functional(functional_changes, client)
+            print(f"[CodeAnalyze] 过滤后: functional={len(functional_changes)}")
+
+            # 第三步：三大类各自合并去重
             print(f"[CodeAnalyze] 合并前: functional={len(functional_changes)}, removed={len(removed_features)}, ui={len(ui_updates)}")
             functional_changes = self._merge_similar_items(functional_changes, "functional", client)
             removed_features = self._merge_similar_items(removed_features, "removed", client)
             print(f"[CodeAnalyze] 合并后: functional={len(functional_changes)}, removed={len(removed_features)}")
+
+            # 第三步：对合并结果批量打 user_visible 标签
+            all_to_label = functional_changes + removed_features
+            if all_to_label:
+                labeled = self._label_visibility(all_to_label, client)
+                if labeled and len(labeled) == len(all_to_label):
+                    functional_changes = labeled[:len(functional_changes)]
+                    removed_features = labeled[len(functional_changes):]
 
             llm_result = {
                 "functional_changes": functional_changes,
@@ -638,7 +669,7 @@ class CodeAnalyzeService:
             desc = it.get("description", "")
             entries.append(f"{i+1}. {name} — {desc}")
 
-        prompt = f"""以下是一次代码迭代中提取出的{len(entries)}个变更条目，其中有大量重复或高度相似的条目。
+        prompt = f"""以下是一次代码迭代中提取出的{len(entries)}个变更条目，其中有一些重复或高度相似的条目。
 
 输入条目：
 {chr(10).join(entries)}
@@ -652,11 +683,12 @@ class CodeAnalyzeService:
 }}
 
 规则：
-- 含义完全相同或高度相似的条目必须合并为一条
-- 合并后的 description 整合多条的核心信息，50-100 字，用自然语言表达，不要包含代码定义
-- 合并后如果还有多个条目，就输出多个
-- items 数组的长度必须少于或等于输入条目的数量
-- 不要原文照搬输入，要主动合并精简"""
+- 将描述同一功能模块、description相近或有重合的条目合并为一条，重点关注名称相近的条目
+- 综合考虑 description 和名称判断，既不能漏掉相似条目，也不能误合并不同条目
+- 多个描述同一功能的条目合并为一条，一个条目最多只能参与合并一次，避免合并后出现两个条目中存在重复的描述
+- 合并后的 description 整合多条的核心信息，50-150 字，用自然语言表达
+- 合并后的名称重新提炼，15 字以内，动词开头
+- 合并后如果还有多个不同的条目，就输出多个"""
         try:
             resp = client.chat(system=prompt, user="", temperature=0.0, max_tokens=4096, seed=42)
             print(f"[CodeAnalyze] 合并响应前200字: {resp[:200]}")
@@ -712,7 +744,7 @@ class CodeAnalyzeService:
                     "description": merged_desc or best_match.get("description", ""),
                     "confidence": max_conf,
                     "evidence_files": deduped_files,
-                    "user_visible": best_match.get("user_visible", True),
+                    "user_visible": True,
                 })
 
             if len(merged) < len(items):
@@ -724,6 +756,105 @@ class CodeAnalyzeService:
 
         except (json.JSONDecodeError, Exception) as e:
             print(f"[CodeAnalyze] 语义合并失败 ({category}): {e}")
+            return items
+
+
+    def _label_visibility(self, items: list, client: LLMClient) -> list:
+        """对合并后的结果批量打 user_visible 标签。"""
+        if not items:
+            return items
+
+        entries = []
+        for i, it in enumerate(items):
+            name = it.get("name", "")
+            desc = it.get("description", "")
+            entries.append(f"{i+1}. {name} — {desc}")
+
+        prompt = f"""以下是一次代码迭代的变更结果，请为每条结果判断用户可见程度。
+输出严格 JSON：
+{{"labels": [
+  {{"index": 1, "user_visible": true}},
+  {{"index": 2, "user_visible": false}}
+]}}
+
+条目：
+{chr(10).join(entries)}
+
+规则：
+- true=用户可见（用户可直接感知的功能变化：新页面、新按钮、新功能入口、UI变化）
+- false=用户不可见（纯后端逻辑、配置变更、基础设施调整）
+- "partial"=部分可见（同一变更中既有前端可见也有后端不可见部分）"""
+        try:
+            resp = client.chat(system=prompt, user="", temperature=0.0, max_tokens=2048, seed=42)
+            result = json.loads(resp)
+            labels = result.get("labels", []) if isinstance(result, dict) else []
+            if not labels:
+                return items
+            for label in labels:
+                idx = label.get("index", 0) - 1
+                if 0 <= idx < len(items):
+                    items[idx]["user_visible"] = label.get("user_visible", True)
+            return items
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"[CodeAnalyze] 打标失败: {e}")
+            return items
+
+
+    def _filter_non_functional(self, items: list, client: LLMClient) -> list:
+        """过滤与平台业务功能无关的条目（常量定义、枚举、代码重构、工具函数等）。"""
+        if not items:
+            return items
+
+        entries = []
+        for i, it in enumerate(items):
+            name = it.get("name", "")
+            desc = it.get("description", "")
+            entries.append(f"{i+1}. {name} — {desc}")
+
+        prompt = f"""以下是一次代码迭代中提取的变更条目，请根据描述判断每条属于哪一类。
+
+条目：
+{chr(10).join(entries)}
+
+输出严格 JSON：
+{{"keep": [1, 3], "filter": [2]}}
+
+**分类标准：**
+
+→ 应保留（keep）— 业务功能变更
+条目的描述指向一个**具体的业务功能变化**，比如：
+- 新增/修改了某个用户可操作的功能（页面、弹窗、按钮、列表、表单等）
+- 新增/修改了某项业务逻辑（API调用、数据处理、状态管理、权限判断等）
+- 新增/修改了某种交互行为（点击、跳转、筛选、排序、搜索等）
+- 新增/修改了业务配置项、开关、策略等
+
+→ 应过滤（filter）— 底层架构/基础设施修改
+条目的描述指向**代码内部的技术调整**，对业务功能无直接影响，比如：
+- 更新了底层数据结构或映射关系
+- 新增了常量枚举、类型定义等纯代码层面的变更
+- 重构了代码结构、提取公共方法、重命名等
+- 调整了工具函数、纯数据转换逻辑
+- 更新了注释、日志、格式化等非功能变更
+
+**核心判断原则：** 看描述是否指向一个**具体的业务功能变化**。如果是就保留，如果只是代码层面的技术调整就过滤。拿不准时归入 keep。"""
+        try:
+            resp = client.chat(system=prompt, user="", temperature=0.0, max_tokens=2048, seed=42)
+            result = json.loads(resp)
+            keep = result.get("keep", []) if isinstance(result, dict) else []
+            if not keep:
+                return items
+            kept = []
+            for idx in keep:
+                i = idx - 1
+                if 0 <= i < len(items):
+                    kept.append(items[i])
+            if kept:
+                filtered_count = len(items) - len(kept)
+                print(f"[CodeAnalyze] 过滤非功能项: {filtered_count} 条")
+                return kept
+            return items
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"[CodeAnalyze] 过滤失败: {e}")
             return items
 
 

@@ -10,13 +10,13 @@
 import React, { useState, useRef, useCallback } from 'react'
 import {
   Typography, Input, Button, Card, Steps, Tag, Space, Alert, message,
-  Upload, Table, Modal, Spin, Empty, Radio, Checkbox,
+  Upload, Table, Modal, Spin, Empty, Radio, Checkbox, Divider,
 } from 'antd'
 import {
   ThunderboltOutlined, FileTextOutlined, LinkOutlined,
   UploadOutlined, SendOutlined, ReloadOutlined,
   DownloadOutlined, EditOutlined, EyeOutlined,
-  CheckCircleOutlined, LoadingOutlined,
+  CheckCircleOutlined, LoadingOutlined, RightCircleOutlined,
 } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -25,7 +25,7 @@ import {
   createSession, simpleGenerate, startChat, chatRound,
   generateOutline, generateSection, regenerateSection,
   updateSection, getVersions, getVersionContent,
-  exportPRD, uploadFile, parseMinutes,
+  exportPRD, uploadFile, parseMinutes, rechatTopic,
 } from '../api/prdGen'
 import type {
   SectionEvent, SectionCompleteEvent, ChatRoundResponse,
@@ -44,12 +44,24 @@ const SECTION_LABELS: Record<string, string> = {
   nonfunctional: '非功能需求',
 }
 
+// 7 个话题（与后端 _QUESTION_TOPICS 完全对齐）
+const TOPIC_STEPS = [
+  { title: '问题与方案', icon: '💡' },
+  { title: '用户与场景', icon: '👥' },
+  { title: '核心功能', icon: '🎯' },
+  { title: '操作流程', icon: '➡️' },
+  { title: '边界与约束', icon: '🚧' },
+  { title: '非功能需求', icon: '⚡' },
+  { title: '依赖与范围', icon: '🔗' },
+]
+
 type StepStatus = 'wait' | 'process' | 'finish' | 'error'
 
 interface ChatMsg {
   role: 'user' | 'system'
   content: string
   round: number
+  topic?: string  // 可选，标识该消息所属话题
 }
 
 interface VersionDisplay {
@@ -84,6 +96,8 @@ export default function PrdGen() {
   const [readyForOutline, setReadyForOutline] = useState(false)
   const [readyReason, setReadyReason] = useState('')
   const [currentTopic, setCurrentTopic] = useState('')
+  const [completedTopics, setCompletedTopics] = useState<string[]>([])
+  const [topicHistoryStart, setTopicHistoryStart] = useState<number>(0) // 当前话题在 chatHistory 中的起始索引
 
   // ── 生成状态 ──
   const [generating, setGenerating] = useState(false)
@@ -214,12 +228,16 @@ export default function PrdGen() {
   // ── 中等模式对话 ──
   const handleStartChat = async (sid: string) => {
     setChatting(true)
+    setCompletedTopics([])
+    setTopicHistoryStart(0)
     try {
       const result: ChatRoundResponse = await startChat(sid)
       if (result.question) {
         setCurrentQuestion(result.question)
         setCurrentTopic(result.topic || '')
-        setChatHistory(prev => [...prev, { role: 'system', content: result.question!, round: result.round }])
+        // 标记当前话题开始
+        setTopicHistoryStart(chatHistory.length)
+        setChatHistory(prev => [...prev, { role: 'system', content: result.question!, round: result.round, topic: result.topic }])
       }
     } catch (e: any) {
       message.error(e?.message || '启动对话失败')
@@ -232,17 +250,33 @@ export default function PrdGen() {
     setChatting(true)
     try {
       const result: ChatRoundResponse = await chatRound(sid, answer)
-      setChatHistory(prev => [...prev, { role: 'user', content: answer, round: result.round }])
+      const prevTopic = currentTopic
+      const newChatMsg: ChatMsg = { role: 'user', content: answer, round: result.round, topic: prevTopic }
+      setChatHistory(prev => [...prev, newChatMsg])
       setChatAnswer('')
 
+      // 检测话题切换
+      if (result.topic && result.topic !== prevTopic) {
+        // 话题变了！标记已完成话题
+        if (prevTopic) {
+          setCompletedTopics(prev => [...prev, prevTopic])
+        }
+        setCurrentTopic(result.topic)
+        setTopicHistoryStart(chatHistory.length + 1) // +1 因为刚加了 user 消息
+      }
+
       if (result.status === 'ready_for_outline') {
+        // 标记最后一个话题也完成
+        if (currentTopic) {
+          setCompletedTopics(prev => [...prev, currentTopic])
+        }
         // 进入用户确认环节
         setReadyForOutline(true)
         setReadyReason(result.reason || '信息已收集完成')
       } else if (result.question) {
         setCurrentQuestion(result.question)
-        setCurrentTopic(result.topic || '')
-        setChatHistory(prev => [...prev, { role: 'system', content: result.question!, round: result.round }])
+        const systemMsg: ChatMsg = { role: 'system', content: result.question, round: result.round, topic: result.topic || currentTopic }
+        setChatHistory(prev => [...prev, systemMsg])
       }
     } catch (e: any) {
       message.error(e?.message || '对话失败')
@@ -258,6 +292,29 @@ export default function PrdGen() {
     setSessionStatus('writing')
     message.success('开始生成大纲')
     await handleGenerateOutline(sessionId)
+  }
+
+  /** 重新讨论某个已完成话题 */
+  const handleRechatTopic = async (topic: string) => {
+    if (!sessionId) return
+    setReadyForOutline(false)
+    setChatting(true)
+    try {
+      const result = await rechatTopic(sessionId, topic)
+      if (result.question) {
+        // 将该话题从 completedTopics 移除，设置为当前话题
+        setCompletedTopics(prev => prev.filter(t => t !== topic))
+        setCurrentTopic(topic)
+        setCurrentQuestion(result.question)
+        // 恢复 chatting 状态
+        const systemMsg: ChatMsg = { role: 'system', content: result.question, round: result.round, topic: topic }
+        setChatHistory(prev => [...prev, systemMsg])
+      }
+    } catch (e: any) {
+      message.error(e?.message || '重新讨论失败')
+    } finally {
+      setChatting(false)
+    }
   }
 
   const handleSendChat = () => {
@@ -515,6 +572,9 @@ export default function PrdGen() {
     setReadyReason('')
     setReadyForOutline(false)
     setReadyReason('')
+    setCurrentTopic('')
+    setCompletedTopics([])
+    setTopicHistoryStart(0)
     setMinutesResult(null)
     setUploadedFiles([])
     setShowDiff(false)
@@ -647,28 +707,141 @@ export default function PrdGen() {
   const renderChatSection = () => {
     if (mode !== 'medium' || sessionStatus !== 'chatting') return null
 
-    const topicLabels = ['问题与方案', '背景与战略', '用户与场景', '需求与优先级', '非功能与边界', '技术依赖与风险', '分阶段范围']
-    const topicIdx = currentTopic ? topicLabels.findIndex(t => currentTopic.includes(t.slice(0, 4))) : -1
+    // 计算当前话题在 TOPIC_STEPS 中的索引
+    const currentTopicIdx = currentTopic
+      ? TOPIC_STEPS.findIndex(t => currentTopic.includes(t.title.slice(0, 4)) || t.title === currentTopic)
+      : -1
+
+    // 构建 Steps items
+    const topicStepItems = TOPIC_STEPS.map((t, idx) => {
+      const isCompleted = completedTopics.includes(t.title)
+      const isCurrent = idx === currentTopicIdx
+      return {
+        title: t.title,
+        status: (isCompleted ? 'finish' : isCurrent ? 'process' : 'wait') as 'finish' | 'process' | 'wait',
+        icon: isCompleted ? <CheckCircleOutlined style={{ color: '#52c41a' }} />
+              : isCurrent ? <RightCircleOutlined style={{ color: '#6366f1' }} />
+              : undefined,
+      }
+    })
+
+    // 检测话题切换，给对话历史插入分隔线
+    const renderMessages = () => {
+      let lastTopic = ''
+      return chatHistory.map((msg, i) => {
+        const showDivider = msg.topic && msg.topic !== lastTopic && lastTopic !== ''
+        const isTopicStart = msg.topic && msg.topic !== lastTopic
+        if (msg.topic) lastTopic = msg.topic
+
+        // 话题切换分隔线
+        const divider = showDivider ? (
+          <div key={`divider-${i}`} style={{ margin: '12px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Divider style={{ flex: 1, margin: 0 }} />
+            <Tag color="purple" style={{ borderRadius: 8, fontSize: 11, flexShrink: 0, margin: 0 }}>
+              🎯 进入话题：{msg.topic}
+            </Tag>
+            <Divider style={{ flex: 1, margin: 0 }} />
+          </div>
+        ) : null
+
+        const isCurrentTopicMsg = msg.topic === currentTopic
+
+        return (
+          <React.Fragment key={i}>
+            {divider}
+            <div style={{
+              marginBottom: 8,
+              padding: '8px 12px',
+              borderRadius: 8,
+              background: msg.role === 'user' ? '#e8f4fd' : (isCurrentTopicMsg ? '#f0f5ff' : '#f5f5f5'),
+              textAlign: msg.role === 'user' ? 'right' : 'left',
+              borderLeft: msg.role === 'system' && isTopicStart ? '3px solid #6366f1' : undefined,
+            }}>
+              <Text>{msg.content}</Text>
+            </div>
+          </React.Fragment>
+        )
+      })
+    }
 
     return (
       <Card title="需求引导对话" size="small" style={{ marginBottom: 16 }}>
+        {/* 话题流水线 Steps */}
+        {currentTopic && (
+          <div style={{ marginBottom: 16, padding: '12px 16px', background: '#f8f9ff', borderRadius: 8, border: '1px solid #e8eaff' }}>
+            <Steps
+              current={currentTopicIdx >= 0 ? currentTopicIdx : 0}
+              size="small"
+              items={topicStepItems}
+              style={{
+                ['--ant-steps-nav-arrow-color' as string]: '#6366f1',
+                ['--ant-steps-icon-active-color' as string]: '#6366f1',
+                ['--ant-steps-heading-color' as string]: '#6366f1',
+                ['--ant-steps-finish-icon-color' as string]: '#52c41a',
+                ['--ant-steps-finish-heading-color' as string]: '#52c41a',
+              }}
+            />
+          </div>
+        )}
+
         {readyForOutline ? (
           <div>
             <Alert
               type="success"
               showIcon
-              message="信息收集完成"
-              description={readyReason || 'LLM 判断信息已足够开始撰写 PRD'}
-              style={{ marginBottom: 12 }}
+              message="🎉 所有话题已收集完成"
+              description={readyReason || '对话已覆盖全部 7 个话题，请确认信息是否完整'}
+              style={{ marginBottom: 16 }}
             />
+
+            {/* 话题回顾列表 */}
+            <div style={{ marginBottom: 16 }}>
+              <Text strong style={{ fontSize: 14, marginBottom: 8, display: 'block' }}>
+                📋 话题回顾 — 点击可重新讨论
+              </Text>
+              {TOPIC_STEPS.map((t, idx) => {
+                const topicName = t.title
+                // 找到该话题在 chatHistory 中的消息
+                const topicMsgs = chatHistory.filter(m => m.topic === topicName || (idx === 0 && !m.topic))
+                const userMsgs = topicMsgs.filter(m => m.role === 'user')
+                return (
+                  <div key={topicName} style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    padding: '8px 12px',
+                    marginBottom: 6,
+                    background: '#f9fafb',
+                    borderRadius: 8,
+                    border: '1px solid #e5e7eb',
+                  }}>
+                    <Space>
+                      <span style={{ fontSize: 12, color: '#52c41a' }}>✅</span>
+                      <Text strong style={{ fontSize: 13 }}>{topicName}</Text>
+                      <Text style={{ fontSize: 12, color: '#6b7280' }}>
+                        {userMsgs.length > 0 ? `${userMsgs.length} 条回答` : '已跳过'}
+                      </Text>
+                    </Space>
+                    <Button
+                      size="small"
+                      icon={<EditOutlined />}
+                      onClick={() => handleRechatTopic(topicName)}
+                    >
+                      修改
+                    </Button>
+                  </div>
+                )
+              })}
+            </div>
+
             <Space>
-              <Button type="primary" onClick={handleConfirmOutline}>
+              <Button type="primary" size="large" onClick={handleConfirmOutline}>
                 确认，开始生成大纲
               </Button>
               <Button onClick={() => {
                 setReadyForOutline(false)
                 setCurrentQuestion('还有哪些信息需要补充？请告诉我。')
-                setChatHistory(prev => [...prev, { role: 'system', content: '还有哪些信息需要补充？请告诉我。', round: chatHistory.length + 1 }])
+                setChatHistory(prev => [...prev, { role: 'system', content: '还有哪些信息需要补充？请告诉我。', round: chatHistory.length + 1, topic: currentTopic }])
               }}>
                 还需要补充
               </Button>
@@ -677,22 +850,17 @@ export default function PrdGen() {
         ) : (
           <>
             {currentTopic && (
-              <div style={{ marginBottom: 12, padding: '6px 12px', background: '#f0f5ff', borderRadius: 6, fontSize: 12 }}>
-                <Text type="secondary">当前话题：{currentTopic}</Text>
+              <div style={{ marginBottom: 12, padding: '6px 14px', background: '#eef2ff', borderRadius: 6, borderLeft: '3px solid #6366f1' }}>
+                <Text strong style={{ color: '#6366f1', fontSize: 13 }}>
+                  💬 当前话题：{currentTopic}
+                </Text>
+                <Text style={{ marginLeft: 8, fontSize: 12, color: '#6b7280' }}>
+                  （{completedTopics.length + 1}/{TOPIC_STEPS.length}）
+                </Text>
               </div>
             )}
             <div style={{ maxHeight: 300, overflow: 'auto', marginBottom: 12 }}>
-              {chatHistory.map((msg, i) => (
-                <div key={i} style={{
-                  marginBottom: 8,
-                  padding: '8px 12px',
-                  borderRadius: 8,
-                  background: msg.role === 'user' ? '#e8f4fd' : '#f5f5f5',
-                  textAlign: msg.role === 'user' ? 'right' : 'left',
-                }}>
-                  <Text>{msg.content}</Text>
-                </div>
-              ))}
+              {renderMessages()}
             </div>
             <Space.Compact style={{ width: '100%' }}>
               <Input

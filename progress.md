@@ -765,3 +765,74 @@ Console 输出 `completedRef: Array(3)` 缺 active_rate。根因: 手写 SSE 解
 
 3. **GitLab Token 记录**
    - 保存到 `memory/gitlab-token.md`
+
+---
+
+## 2026-07-08 · 代码变更分析前端优化 + PRD 模块准备
+
+### 代码变更分析前端优化
+- **移除"刷新知识快照"按钮**：删除了 `refreshSnapshot`、`getSnapshotInfo`、`ReloadOutlined` 相关全部代码
+- **横向 Steps 流水线**：Steps 改为默认横向，右侧显示状态标签（如"6/8 步完成"）
+- **配置区 UI 美化**：两行布局，图标前缀（GitHub/Branch/Calendar/Folder），小标签说明，圆角输入框
+- **整体色系**：`#6366f1` 紫蓝色主色，`#f5f5ff` 背景
+- **新增 `user_visible` 过滤**：前端过滤 `user_visible === false` 的条目
+- **TypeScript 类型修正**：`user_visible` 类型从 `boolean` 改为 `boolean | "partial"`
+- 前端 TypeScript 编译零错误 ✅
+
+### 涉及文件
+- `frontend/src/pages/CodeAnalyze.tsx` — 重写（移除刷新按钮、横向 Steps、美化配置区、主题色）
+- `frontend/src/api/codeAnalyze.ts` — `user_visible` 类型改为 `boolean | "partial"`
+
+---
+
+## 2026-07-08 · PRD 模块状态总览
+
+### 当前状态
+- 完整前后端链路已搭建（Phase 1-7 全部完成）
+- 两种模式：简单模式（大纲→逐章节流式）、中等模式（7 话题问答引导→大纲→章节）
+- 9 节输出模板（Overview/Background/Stories/Requirements/Design/Technical/Rollout/Questions/Appendix）
+- 信息完备度检查、版本管理（最近 3 版）、Diff 对比、妙记解析、文件上传、导出
+- 中等模式对话质量仍在迭代中（4 轮迭代后暂停，切换回前端优化）
+
+### Prompt 深度优化（2026-07-08）
+- **系统 Prompt**：从"你是机器学习平台的产品需求文档撰写助手"升级为"资深产品经理" persona，增加 5 条质量标准（精确性/完整性/可执行性/结构化/数据驱动）和 6 条写作原则
+- **大纲 Prompt**：从纯章节列表改为 `{id, focus}` 结构，每章带核心方向说明
+- **9 章节 Prompt 全部重写**：每章增加：
+  - 详细子节结构（3-4 个子节，含具体示例）
+  - 质量门禁（✅ 要求 / ❌ 禁止）
+  - 反模式约束（如"需求题不能没有优先级标注"）
+  - 具体示例（如用户故事章节带完整 US-001 示例）
+- **妙记提取 Prompt**：增加 `existing_workflow`、`pain_points` 字段，添加过滤规则（过滤寒暄/会议流程/非技术讨论）
+- 涉及文件：`backend/services/prd_gen_service.py`
+
+### 中等模式话题转换视觉优化（2026-07-08）
+- **修复前后端话题名不对齐**：前端 `topicLabels` 之前是硬编码的 7 个不同名字，与后端 `_QUESTION_TOPICS` 不匹配，现在统一用 `TOPIC_STEPS` 常量对齐
+- **新增话题流水线 Steps**：对话区顶部横向 7 步进度条，已完成 ✅ / 当前 ⏳ / 待开始
+- **话题切换分隔线**：话题切换时自动插入紫色 Tag 分隔线 "🎯 进入话题：XXX"
+- **当前话题高亮**：当前话题的消息气泡带紫色左边框 + 浅蓝背景
+- **话题进度指示**：当前话题卡片显示 "💬 当前话题：XXX（3/7）"
+- **ChatMsg 接口扩展**：新增 `topic` 字段，追踪每条消息所属话题
+- 涉及文件：`frontend/src/pages/PrdGen.tsx`
+
+### 中等模式话题推进逻辑优化（2026-07-08）
+- **关键词强制推进**：用户说"下一话题/继续/跳过"等关键词 → `force_advance = True`，直接进入下一话题，不给 LLM 判断机会
+- 关键词列表：`下一话题, 下一个, 继续, 跳过, next topic, 进入下一话题, 换话题, 够了`
+- **Prompt 告知 LLM**：`_QUESTION_PROMPT` 新增第 7 条规则，告知 LLM 用户可以说"下一话题"
+- 原有 3 轮上限兜底保留（双重保障）
+- 涉及文件：`backend/services/prd_gen_service.py`
+
+### 中等模式全部话题完成后的回顾审查屏（2026-07-08）
+- **新增回顾审查屏**：全部 7 话题完成后不再直接跳转大纲，而是展示所有话题列表（✅ + 话题名 + 回答条数）
+- **"修改"按钮**：每个话题右侧有"修改"按钮，点击触发 `rechat_topic`，重新进入该话题讨论
+- **后端新增 `rechat_topic()`**：将指定话题从 `completed_topics` 移除，回退 `_current_topic_idx`，LLM 根据历史对话生成承上启下的引导问题
+- **新增端点**：`POST /api/prd/sessions/{id}/rechat-topic`
+- 涉及文件：`backend/services/prd_gen_service.py`、`backend/routers/prd_gen.py`、`frontend/src/pages/PrdGen.tsx`、`frontend/src/api/prdGen.ts`
+
+### 章节生成注入前序章节内容摘要（2026-07-08）
+- **新增 `_build_preceding_sections_text()`**：按大纲顺序提取已生成的前序章节，取前 150 字摘要，注入 Prompt
+- **注入内容**：章节名称 + 前 150 字摘要 + 一致性约束
+- **效果**：后续章节能看到前面章节写了什么，避免矛盾和不一致
+- **简单模式 & 中等模式**都受益（`simple_generate()` 和 `generate_section()` 均修改）
+- **Prompt 变更**：每个章节 Prompt 现在包含 `collected_info（三来源）+ 前序章节摘要 + 一致性约束`
+- 涉及文件：`backend/services/prd_gen_service.py`
+- 涉及文件：`frontend/src/pages/PrdGen.tsx`

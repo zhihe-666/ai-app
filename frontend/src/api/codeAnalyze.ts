@@ -28,7 +28,7 @@ export interface AnalysisResult {
     confidence: number
     evidence_files: string[]
     description: string
-    user_visible?: boolean
+    user_visible?: boolean | "partial"
   }>
   removed_features?: Array<{
     name: string

@@ -161,6 +161,11 @@ export async function chatRound(sessionId: string, answer: string): Promise<Chat
   return post(`/sessions/${sessionId}/chat`, { answer })
 }
 
+/** 4a. 重新讨论已完成话题 */
+export async function rechatTopic(sessionId: string, topic: string): Promise<ChatRoundResponse> {
+  return post(`/sessions/${sessionId}/rechat-topic`, { topic })
+}
+
 /** 4. 查询完备度 */
 export async function getCompleteness(sessionId: string): Promise<CompletenessResult> {
   return get_(`/sessions/${sessionId}/completeness`)

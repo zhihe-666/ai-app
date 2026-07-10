@@ -785,6 +785,68 @@ Console 输出 `completedRef: Array(3)` 缺 active_rate。根因: 手写 SSE 解
 
 ---
 
+## 2026-07-10 · 功能变更分析模块全面优化
+
+### 问题背景
+功能变更分析模块存在多个问题：AST 分析秒过、git fetch 失败、合并不稳定（有时过度合并 108→8 条，有时完全不合并）、提取 prompt 信息不足、取消不生效、提取遗漏（全局搜索缺失）、日志不实时、去重效果差、过滤不彻底。
+
+### 修复清单
+
+#### 1. 提取 prompt 增强
+- **输入**：`file_content`（第一文件前 50 行）→ `diff_snippets`（每个文件的 git diff patch，含前后各 50 行上下文）
+- **新增**：`signal_details`，传具体 API 路径、状态名、路由名等细节
+- **max_tokens**：4096 → 8192
+- **diff 上下文**：`git diff -U50`（前后各 50 行），AST 工具截断到 5000 字符
+- 涉及文件：`backend/services/code_analyze_service.py`、`tools/code-analyzer/src/snippet/extractSnippet.ts`
+
+#### 2. 合并策略重写（三级流水线）
+- **Level 1 目录聚类**：按 `pages/xxx` 模块名聚类，`page-logic/` 归一化为 `pages/`
+- **Level 2 堆内 LLM 合并**：每堆独立调用 LLM
+- **Level 3 全量二次合并**：直接全局语义合并，不再依赖证据文件匹配
+- **新增 prompt 规则**：同类操作跨页面合并（如多个埋点条目合并为一条）
+- 涉及文件：`backend/services/code_analyze_service.py`
+
+#### 3. 过滤 prompt 加强
+- 明确列出反例（纯枚举/常量/类型定义变更、纯参数调整、代码重构/重命名）
+- 改"拿不准时归入 keep" → "拿不准时不要默认归入 keep"
+- 涉及文件：`backend/services/code_analyze_service.py`
+
+#### 4. git fetch 修复
+- `git fetch --all --prune` → `git fetch origin +refs/heads/*:refs/heads/* --prune --force`
+- 失败后自动 re-clone
+- 删除 stale commit cache
+- 涉及文件：`backend/services/code_analyze_service.py`
+
+#### 5. 日志实时化
+- `print()` 输出被 pipe 缓冲 → `sys.stdout.reconfigure(line_buffering=True)`
+- 每步加时间戳日志 `[CodeAnalyze] [HH:MM:SS] 步骤名 (耗时)`
+- AST 子进程加 retcode、耗时、stdout/stderr 日志
+- 涉及文件：`backend/services/code_analyze_service.py`
+
+#### 6. 中间结果保存（调试用）
+- 保存 per-group LLM 结果 → `{task_id}_llm_per_group.json`
+- 保存合并前后列表 → `{task_id}_merge_pipeline.json`
+- 保存最终结果 → `{task_id}_llm_final.json`
+- 涉及文件：`backend/services/code_analyze_service.py`
+
+#### 7. 前端路径默认值
+- `['apps/algorithm/ml-data']` → `['apps/algorithm/ml-data', 'apps/algorithm/ml-main']`
+- 补全全局搜索（GlobalSearch）等功能提取
+- 涉及文件：`frontend/src/pages/CodeAnalyze.tsx`
+
+#### 8. 前端文件展示限制
+- 证据文件最多展示 20 个，超出显示 "+N 个文件"
+- 涉及文件：`frontend/src/pages/CodeAnalyze.tsx`
+
+### 涉及文件
+- `backend/services/code_analyze_service.py` — 提取 prompt、合并策略、过滤、fetch、日志、调试保存
+- `backend/routers/code_analyze.py` — 移除不存在的 `request.is_disconnected()`
+- `tools/code-analyzer/src/snippet/extractSnippet.ts` — diffHunk 截断 1000→5000 字符
+- `frontend/src/pages/CodeAnalyze.tsx` — 默认路径双项、文件展示限制 20 个
+- `docs/功能变更分析模块介绍.md` — 同步更新文档
+
+---
+
 ## 2026-07-08 · PRD 模块状态总览
 
 ### 当前状态

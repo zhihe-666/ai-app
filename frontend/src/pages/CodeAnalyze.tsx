@@ -46,7 +46,7 @@ export default function CodeAnalyze() {
   const [repoUrl, setRepoUrl] = useState(DEFAULT_REPO)
   const [branch, setBranch] = useState('master')
   const [dateRange, setDateRange] = useState<[dayjs.Dayjs, dayjs.Dayjs] | null>(null)
-  const [selectedPaths, setSelectedPaths] = useState<string[]>(['apps/algorithm/ml-data'])
+  const [selectedPaths, setSelectedPaths] = useState<string[]>(['apps/algorithm/ml-data', 'apps/algorithm/ml-main'])
   const [analyzing, setAnalyzing] = useState(false)
   const [result, setResult] = useState<AnalysisResult | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -386,7 +386,7 @@ export default function CodeAnalyze() {
           )}
 
           {/* Export buttons */}
-          {result.functional_changes && result.functional_changes.filter(f => f.user_visible !== false).length > 0 && (
+          {result.functional_changes && result.functional_changes.length > 0 && (
             <Space style={{ marginBottom: 16 }}>
               <Button
                 icon={<FileTextOutlined />}
@@ -413,12 +413,12 @@ export default function CodeAnalyze() {
           )}
 
           {/* Functional Changes */}
-          {result.functional_changes && result.functional_changes.filter(f => f.user_visible !== false).length > 0 && (
+          {result.functional_changes && result.functional_changes.length > 0 && (
             <div style={{ marginBottom: 20 }}>
               <Text strong style={{ fontSize: 15 }}>
-                <Tag color="blue" style={{ borderRadius: 8 }}>📦 功能变更 ({result.functional_changes.filter(f => f.user_visible !== false).length})</Tag>
+                <Tag color="blue" style={{ borderRadius: 8 }}>📦 功能变更 ({result.functional_changes.length})</Tag>
               </Text>
-              {result.functional_changes.filter(f => f.user_visible !== false).map((f, i) => (
+              {result.functional_changes.map((f, i) => (
                 <Card
                   key={i}
                   size="small"
@@ -433,9 +433,6 @@ export default function CodeAnalyze() {
                   <Space>
                     <Text strong style={{ color: '#1f2937' }}>{f.name}</Text>
                     {f.confidence && <Tag style={{ borderRadius: 8, fontSize: 11 }}>conf: {f.confidence.toFixed(2)}</Tag>}
-                    {f.user_visible === true && <Tag color="blue" style={{ borderRadius: 8 }}>用户可见</Tag>}
-                    {f.user_visible === false && <Tag color="default" style={{ borderRadius: 8 }}>用户不可见</Tag>}
-                    {f.user_visible === "partial" && <Tag color="orange" style={{ borderRadius: 8 }}>部分可见</Tag>}
                   </Space>
                   {f.description && (
                     <Paragraph style={{ marginTop: 8, marginBottom: 4, color: '#4b5563', fontSize: 13 }}>
@@ -444,7 +441,7 @@ export default function CodeAnalyze() {
                   )}
                   {f.evidence_files && f.evidence_files.length > 0 && (
                     <Space wrap style={{ marginTop: 6 }}>
-                      {f.evidence_files.map((file, j) => (
+                      {f.evidence_files.slice(0, 20).map((file, j) => (
                         <Tooltip key={j} title={file}>
                           <Tag style={{
                             maxWidth: 260,
@@ -458,6 +455,11 @@ export default function CodeAnalyze() {
                           </Tag>
                         </Tooltip>
                       ))}
+                      {f.evidence_files.length > 20 && (
+                        <Tag style={{ fontSize: 11, borderRadius: 6, border: `1px solid ${THEME.border}`, background: '#f5f5f5' }}>
+                          +{f.evidence_files.length - 20} 个文件
+                        </Tag>
+                      )}
                     </Space>
                   )}
                 </Card>
@@ -518,7 +520,7 @@ export default function CodeAnalyze() {
           )}
 
           {/* Empty state */}
-          {(!result.functional_changes || result.functional_changes.filter(f => f.user_visible !== false).length === 0) &&
+          {(!result.functional_changes || result.functional_changes.length === 0) &&
            (!result.removed_features || result.removed_features.length === 0) &&
            (!result.ui_updates || result.ui_updates.length === 0) && (
             <Empty description="未检测到有效变更" />

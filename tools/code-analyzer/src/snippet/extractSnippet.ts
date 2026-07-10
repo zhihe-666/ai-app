@@ -14,7 +14,7 @@ export function extractSnippet(hunk: HunkInfo, allSignals: string[]): Snippet {
     signals: allSignals.map(type => ({ type: type as any, detail: '' })),
     before,
     after,
-    diffHunk: hunk.rawText.slice(0, 1000),
+    diffHunk: hunk.rawText.slice(0, 5000),
   };
 }
 

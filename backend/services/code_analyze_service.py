@@ -5,9 +5,14 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
+import sys
 from datetime import datetime
 from pathlib import Path
+
+# Line-buffer stdout so [CodeAnalyze] logs appear in real-time
+sys.stdout.reconfigure(line_buffering=True)
 
 from services.llm_client import LLMClient
 from services.db import get_commit_cache, save_commit_cache
@@ -87,29 +92,46 @@ class CodeAnalyzeService:
 
         try:
             yield from self._emit_progress("git_fetch", "拉取远程仓库...", 10, 1, 8)
+            t0 = time.time()
+            print(f"[CodeAnalyze] [{datetime.now().strftime('%H:%M:%S')}] 开始拉取仓库...")
             self._git_fetch(repo_url)
+            print(f"[CodeAnalyze] [{datetime.now().strftime('%H:%M:%S')}] git fetch 完成 ({time.time()-t0:.1f}s)")
 
             yield from self._emit_progress("resolve_commits", "定位时间段 commits...", 20, 2, 8)
+            t0 = time.time()
             base, target = self._resolve_commits(branch, start_time, end_time)
+            print(f"[CodeAnalyze] [{datetime.now().strftime('%H:%M:%S')}] resolve commits: {base[:12]}..{target[:12]} ({time.time()-t0:.1f}s)")
 
             yield from self._emit_progress("commit_messages", "收集 commit 信息...", 30, 3, 8)
+            t0 = time.time()
             commit_messages = self._collect_commit_messages(base, target, frontend_paths)
+            print(f"[CodeAnalyze] [{datetime.now().strftime('%H:%M:%S')}] commit 信息: {len(commit_messages)} 条 ({time.time()-t0:.1f}s)")
 
             yield from self._emit_progress("checkout", "检出双版本代码...", 40, 4, 8)
+            t0 = time.time()
             self._checkout_worktree(base, target)
+            print(f"[CodeAnalyze] [{datetime.now().strftime('%H:%M:%S')}] checkout 完成 ({time.time()-t0:.1f}s)")
 
             yield from self._emit_progress("snapshot", "生成知识快照...", 50, 5, 8)
+            t0 = time.time()
             self._ensure_knowledge_snapshot()
+            print(f"[CodeAnalyze] [{datetime.now().strftime('%H:%M:%S')}] 知识快照完成 ({time.time()-t0:.1f}s)")
 
             yield from self._emit_progress("diff", "生成 diff...", 60, 6, 8)
+            t0 = time.time()
             diff_dir = f"{self.task_dir}/diff"
             self._generate_diff(base, target, frontend_paths, diff_dir)
             changed_count = self._count_changed_files(diff_dir)
+            print(f"[CodeAnalyze] [{datetime.now().strftime('%H:%M:%S')}] diff 完成: {changed_count} 个变更文件 ({time.time()-t0:.1f}s)")
             yield from self._emit_section_complete("diff", "Git diff 完成",
                                                     changed_files=changed_count)
 
             yield from self._emit_progress("ast", "正在执行 AST 信号提取...", 70, 7, 8)
+            ast_start = time.time()
+            print(f"[CodeAnalyze] [{datetime.now().strftime('%H:%M:%S')}] AST 分析开始")
             self._run_ast_analysis(diff_dir)
+            ast_elapsed = time.time() - ast_start
+            print(f"[CodeAnalyze] [{datetime.now().strftime('%H:%M:%S')}] AST 分析完成 ({ast_elapsed:.1f}s)")
 
             result_file = f"{self.task_dir}/result.json"
             with open(result_file) as f:
@@ -128,20 +150,41 @@ class CodeAnalyzeService:
             self._cleanup()
 
     def _preserve_debug_files(self):
-        """Copy AST result.json and LLM response to persistent path before cleanup."""
-        import shutil
+        """Copy all intermediate outputs to persistent debug directory."""
         persist_dir = "/tmp/analyze_debug"
         os.makedirs(persist_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        prefix = f"{persist_dir}/{ts}_{self.task_id}"
+
+        # AST result.json
         result_file = f"{self.task_dir}/result.json" if self.task_dir else None
         if result_file and os.path.exists(result_file):
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            shutil.copy2(result_file, f"{persist_dir}/result_{ts}_{self.task_id}.json")
-            print(f"[CodeAnalyze] AST result saved to {persist_dir}/result_{ts}_{self.task_id}.json")
+            shutil.copy2(result_file, f"{prefix}_result.json")
+            print(f"[CodeAnalyze] AST result saved to {prefix}_result.json")
+
+        # LLM per-group response
+        llm_llm = f"{self.task_dir}/llm_per_group.json"
+        if os.path.exists(llm_llm):
+            shutil.copy2(llm_llm, f"{prefix}_llm_per_group.json")
+            print(f"[CodeAnalyze] Per-group LLM saved to {prefix}_llm_per_group.json")
+
+        # LLM final response
+        llm_final = f"{self.task_dir}/llm_final_result.json"
+        if os.path.exists(llm_final):
+            shutil.copy2(llm_final, f"{prefix}_llm_final.json")
+            print(f"[CodeAnalyze] Final LLM result saved to {prefix}_llm_final.json")
+
+        # Merge pipeline detail
+        merge_log = f"{self.task_dir}/merge_pipeline.json"
+        if os.path.exists(merge_log):
+            shutil.copy2(merge_log, f"{prefix}_merge_pipeline.json")
+            print(f"[CodeAnalyze] Merge pipeline log saved to {prefix}_merge_pipeline.json")
+
+        # Legacy: old path
         llm_debug = f"/tmp/llm_response_{self.task_id}.json"
         if os.path.exists(llm_debug):
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            shutil.copy2(llm_debug, f"{persist_dir}/llm_response_{ts}_{self.task_id}.json")
-            print(f"[CodeAnalyze] LLM response saved to {persist_dir}/llm_response_{ts}_{self.task_id}.json")
+            shutil.copy2(llm_debug, f"{prefix}_llm_legacy.json")
+            print(f"[CodeAnalyze] Legacy LLM response saved to {prefix}_llm_legacy.json")
 
     # ---- Private helpers (NOT generators, called directly) ----
 
@@ -159,10 +202,24 @@ class CodeAnalyzeService:
             if result.returncode != 0:
                 raise RuntimeError(f"git clone failed: {result.stderr}")
         else:
-            subprocess.run(
-                ["git", "fetch", "--all", "--prune"],
+            # Use --force to bypass worktree safety checks when bare repo
+            # has stale worktree references from previous sessions
+            result = subprocess.run(
+                ["git", "fetch", "origin", "+refs/heads/*:refs/heads/*", "--prune", "--force"],
                 cwd=self.bare_repo_path, capture_output=True, text=True, timeout=120
             )
+            if result.returncode != 0:
+                # If fetch still fails, delete and re-clone
+                print(f"[CodeAnalyze] git fetch failed ({result.returncode}), re-cloning: {result.stderr[:200]}")
+                import shutil
+                shutil.rmtree(self.bare_repo_path, ignore_errors=True)
+                os.makedirs(GIT_CACHE_DIR, exist_ok=True)
+                result = subprocess.run(
+                    ["git", "clone", "--mirror", repo_url, self.bare_repo_path],
+                    cwd="/tmp", capture_output=True, text=True, timeout=600
+                )
+                if result.returncode != 0:
+                    raise RuntimeError(f"git re-clone failed: {result.stderr}")
 
     def _resolve_commits(self, branch: str, start_time: str, end_time: str):
         # Check cache first — same repo + branch + time range = same commits
@@ -270,7 +327,7 @@ class CodeAnalyzeService:
                 f.write(result.stdout)
 
             result = subprocess.run(
-                ["git", "diff", "--histogram", "--find-renames=80%", base, target, "--", fp],
+                ["git", "diff", "--histogram", "-U50", "--find-renames=80%", base, target, "--", fp],
                 cwd=self.bare_repo_path, capture_output=True, text=True, timeout=60
             )
             filtered_patch = '\n'.join(
@@ -339,16 +396,18 @@ class CodeAnalyzeService:
 
     def _run_ast_analysis(self, diff_dir: str):
         cli_path = os.path.join(CLI_DIR, "dist/index.js")
-        result = subprocess.run(
-            ["node", cli_path,
+        cmd = ["node", cli_path,
              "--base", self.base_worktree,
              "--target", self.target_worktree,
              "--diff-dir", diff_dir,
              "--frontend-paths", ",".join(self._get_all_frontend_paths()),
              "--output", f"{self.task_dir}/result.json",
-             "--mode", "analyze"],
-            capture_output=True, text=True, timeout=180
-        )
+             "--mode", "analyze"]
+        print(f"[CodeAnalyze] AST 子进程启动: {' '.join(cmd[:3])} ... --output ... --mode analyze")
+        ast_start = time.time()
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        ast_elapsed = time.time() - ast_start
+        print(f"[CodeAnalyze] AST 子进程结束: retcode={result.returncode}, 耗时={ast_elapsed:.1f}s, stdout={result.stdout[:200]}, stderr={result.stderr[:200]}")
         if result.returncode != 0:
             raise RuntimeError(f"AST 分析失败: {result.stderr}")
 
@@ -387,15 +446,16 @@ class CodeAnalyzeService:
 **输入：**
 - type: 变更类型（NEW_FEATURE=新增, FEATURE_MODIFY=修改, STYLE_ONLY=样式, 等）
 - files: 涉及的文件列表
-- signals: AST 信号类型列表
+- signals: AST 信号类型 + 具体内容的详细说明，如 "API_CALL: api.submitTrainingJob({...})"
+- diff_snippets: 每个文件的 diff 上下文片段（含 +/- 行和上下文代码），展示改动位置和内容
 - commit_messages: 本次迭代的 commit 信息
-- file_content: 变更后版本的文件内容（含行号，供参考上下文）
 
 **输出格式：** 仅输出一个 JSON 对象，不要包含其他内容：
 {{
-  "category": "15字以内概括，如"PS服务类型支持"、"队列选择优化"，以"新增"/"修改"/"下线"/"调整"等动词开头",
-  "description": "精炼的业务描述（50-150字），说明做了什么、为什么。**不要包含文件路径和代码定义**，用自然语言表达。",
-  "type": "NEW_FEATURE | FEATURE_MODIFY | FEATURE_REMOVAL | STYLE_ONLY"
+  "category": "15字以内概括，以"新增"/"修改"/"下线"/"调整"等动词开头",
+  "description": "精炼业务描述（50-150字），自然语言表达，不含文件路径和代码定义",
+  "type": "NEW_FEATURE | FEATURE_MODIFY | FEATURE_REMOVAL | STYLE_ONLY",
+  "user_visible": true
 }}
 
 **type 规则：**
@@ -404,53 +464,98 @@ class CodeAnalyzeService:
 - 如果 category 以"新增"开头，type 必须为 NEW_FEATURE
 - 如果 category 以"移除"开头，type 必须为 FEATURE_REMOVAL
 
+**user_visible 判断标准：**
+
+→ user_visible = true（用户可见的功能变更）
+该变更是**用户可直接感知或操作的功能变化**，比如：
+- 新增/修改了某个页面、弹窗、按钮、列表、表单等用户可交互的 UI 元素
+- 新增/修改了某项用户可感知的业务逻辑（审批流程、发布策略、权限控制、搜索、对比等）
+- 新增/修改了某种用户可触达的交互行为（点击跳转、筛选、排序、搜索、分享链接等）
+- 新增/修改了用户可见的业务配置项、开关、策略
+
+→ user_visible = false（用户不可见的技术调整）
+该变更是**代码内部的技术调整，用户无法直接感知**，比如：
+- **埋点/追踪类**：新增埋点、重构埋点、修改埋点参数、添加追踪事件（用户看不到埋点本身）
+- **基础设施/代理**：API 代理配置、路由配置、帮助路由、环境配置
+- **纯代码调整**：调整枚举值顺序、修改常量定义、类型定义、接口定义
+- **重构/重命名**：提取公共方法、重命名变量/函数、调整代码结构、拆分组件
+- **工具函数**：纯数据转换逻辑、工具函数优化、数据映射调整
+- **测试类**：新增测试用例、修改测试数据
+
+**核心判断：** 问自己"这个变更，用户在使用产品时能直接看到或感受到吗？"能 → true，不能 → false。
 
 **描述规则：**
 1. 只描述业务功能，**不要包含文件路径、文件名、目录结构**
-2. **不要包含代码中的变量名、函数名、参数名**等代码定义，用自然语言表达。如"首批次最大暂停秒数"而不是"首批次最大暂停秒数（resolveMaxFirstBatchPauseSeconds）"
+2. **不要包含代码中的变量名、函数名、参数名**等代码定义，用自然语言表达
 3. 字数控制在 50-150 字
 4. 语句要通顺完整，不能以"在"或"在...中"开头
 5. 禁止"优化了代码"、"完善了功能"等模糊词汇
-6. 如果是 STYLE_ONLY/UI 类，简要描述样式或交互变更即可"""
+6. 如果是 STYLE_ONLY/UI 类，简要描述样式或交互变更即可
+7. **diff_snippets 和 signals 是理解变更的核心依据**，认真阅读 diff 上下文和信号详情来确定功能变更的本质"""
 
             feature_groups = ast_result.get("featureGroups", [])
             print(f"[CodeAnalyze] Per-group LLM call: {len(feature_groups)} groups")
-
-            def _read_file_annotated(relative_path: str) -> str:
-                """Read target version file with line numbers."""
-                if not self.target_worktree:
-                    return ""
-                full_path = os.path.join(self.target_worktree, relative_path)
-                if not os.path.exists(full_path):
-                    return ""
-                try:
-                    lines = open(full_path, 'r', encoding='utf-8').readlines()
-                    lines = lines[:50]
-                    result = []
-                    for i, line in enumerate(lines, 1):
-                        result.append(f"{i}: {line.rstrip()}")
-                    return '\n'.join(result)
-                except Exception:
-                    return ""
 
             # Use ThreadPoolExecutor to parallelize per-group calls
             def describe_group(fg: dict) -> dict:
                 """Single LLM call for one group: output {category, description, type}."""
                 nonlocal client, group_prompt, commit_messages
                 files = [f.get("path") if isinstance(f, dict) else f for f in (fg.get("files") or [])]
-                signals = fg.get("allSignals") or []
+                all_signals = fg.get("allSignals") or []
 
-                # Read file content for context (first file, first 50 lines)
-                file_content = ""
-                if files:
-                    file_content = _read_file_annotated(files[0])
+                # Build signal_details: type + concrete content
+                signal_details = []
+                fg_files = fg.get("files") or []
+                for f_entry in fg_files:
+                    if isinstance(f_entry, dict):
+                        f_signals = f_entry.get("signals") or []
+                        for sig in f_signals:
+                            sig_type = sig.get("type", "")
+                            sig_detail = sig.get("detail", "")
+                            if sig_detail:
+                                signal_details.append(f"{sig_type}: {sig_detail}")
+                            else:
+                                signal_details.append(sig_type)
+
+                # Deduplicate signal details
+                seen_sigs = set()
+                deduped_sigs = []
+                for s in signal_details:
+                    if s not in seen_sigs:
+                        seen_sigs.add(s)
+                        deduped_sigs.append(s)
+
+                # Build diff_snippets: diff context per file from fg snippets
+                diff_snippets = []
+                fg_snippets = fg.get("snippets") or []
+                for snip in fg_snippets:
+                    snip_file = snip.get("file", "")
+                    # Use diffHunk (git patch with context lines) if available
+                    # AST tool already limits each hunk to 1000 chars
+                    diff_hunk = snip.get("diffHunk", "")
+                    if diff_hunk:
+                        diff_snippets.append(f"--- {snip_file} ---\n{diff_hunk}")
+                    else:
+                        # Fallback: show before/after lines
+                        before = snip.get("before", "")
+                        after = snip.get("after", "")
+                        parts = []
+                        if before:
+                            parts.append(f"- 删除:\n{before[:300]}")
+                        if after:
+                            parts.append(f"+ 新增:\n{after[:300]}")
+                        if parts:
+                            diff_snippets.append(f"--- {snip_file} ---\n" + "\n".join(parts))
+
+                diff_snippets_text = "\n\n".join(diff_snippets) if diff_snippets else "(无 diff 片段)"
+                signal_details_text = "; ".join(deduped_sigs) if deduped_sigs else "(无信号详情)"
 
                 group_input = {
                     "type": fg.get("type"),
                     "files": files,
-                    "signals": signals,
+                    "signals": signal_details_text,
+                    "diff_snippets": diff_snippets_text,
                     "commit_messages": commit_messages,
-                    "file_content": file_content,
                 }
 
                 # Retry up to 2 times on failure
@@ -460,7 +565,7 @@ class CodeAnalyzeService:
                             system=group_prompt,
                             user=json.dumps(group_input, ensure_ascii=False),
                             temperature=0.0,
-                            max_tokens=4096,
+                            max_tokens=8192,
                             seed=42,
                         )
                         result = json.loads(resp)
@@ -470,30 +575,61 @@ class CodeAnalyzeService:
                         category = result.get("category") or ""
                         description = result.get("description") or category
                         llm_type = result.get("type") or ""
+                        llm_visible = result.get("user_visible", True)
+                        # Default to visible if not specified
+                        if isinstance(llm_visible, bool):
+                            user_visible = llm_visible
+                        else:
+                            user_visible = True
 
                         return {
                             "category": category,
                             "description": description,
                             "type": llm_type,
+                            "user_visible": user_visible,
                         }
                     except (json.JSONDecodeError, Exception) as e:
                         if attempt == 0:
                             continue
                         # Fallback: use file name as category
                         fallback_name = files[0].split('/')[-1].replace('.tsx', '').replace('.ts', '') if files else "未知"
-                        return {"category": fallback_name, "description": str(e), "type": ""}
+                        return {"category": fallback_name, "description": str(e), "type": "", "user_visible": False}
 
             # Run per-group LLM calls in parallel
             with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
                 futures = [executor.submit(describe_group, fg) for fg in feature_groups]
                 results = [f.result(timeout=120) for f in futures]
 
-            # 第一步：分类（不合并，先按 type 分到各个类别）
+            # Save per-group LLM results for debugging
+            per_group_log = []
+            for fg, desc_result in zip(feature_groups, results):
+                files = [f.get("path") if isinstance(f, dict) else f for f in (fg.get("files") or [])]
+                per_group_log.append({
+                    "fg_id": fg.get("id"),
+                    "fg_type": fg.get("type"),
+                    "files": files[:3],
+                    "llm_category": desc_result.get("category"),
+                    "llm_type": desc_result.get("type"),
+                    "llm_description": desc_result.get("description", "")[:100],
+                })
+            with open(f"{self.task_dir}/llm_per_group.json", 'w') as f:
+                json.dump(per_group_log, f, ensure_ascii=False, indent=2)
+            print(f"[CodeAnalyze] Per-group LLM results saved ({len(per_group_log)} groups)")
+
+            # 第一步：按 user_visible 过滤 + 按 type 分类
+            # 仅保留用户可见的功能变更（埋点、代理、重构、枚举等不可见项在 per-group 阶段已被标记过滤）
             functional_changes = []
             removed_features = []
             ui_updates = []
+            filtered_count = 0
 
             for fg, desc_result in zip(feature_groups, results):
+                # 检查 user_visible（LLM 在 per-group 阶段已判断）
+                user_visible = desc_result.get("user_visible", True)
+                if not user_visible:
+                    filtered_count += 1
+                    continue
+
                 # 分类优先级：LLM type > category 前缀 > AST type
                 ast_type = fg.get("type", "UNKNOWN")
                 llm_type = desc_result.get("type", "") or ""
@@ -504,7 +640,7 @@ class CodeAnalyzeService:
                     files_list = [f.get("path") if isinstance(f, dict) else f for f in (fg.get("files") or [])]
                     name = files_list[0].split('/')[-1].replace('.tsx', '').replace('.ts', '') if files_list else "未知变更"
 
-                # 确定 gtype：category 前缀 > description 语义 > STYLE_ONLY 兜底 > LLM type > AST type
+                # 确定 gtype
                 if name.startswith("新增") or name.startswith("新建"):
                     gtype = "NEW_FEATURE"
                 elif name.startswith("移除") or name.startswith("删除"):
@@ -536,27 +672,27 @@ class CodeAnalyzeService:
                 elif gtype in ("FEATURE_REMOVAL",):
                     removed_features.append(item)
                 else:
-                    # 只有 STYLE_ONLY 和 UNKNOWN 归为 UI
                     ui_updates.append(name or f"{gtype} - {files[0].split('/')[-1] if files else 'unknown'}")
 
-            # 第二步：过滤与平台功能无关的条目（常量/枚举/代码重构等）
-            print(f"[CodeAnalyze] 过滤前: functional={len(functional_changes)}")
-            functional_changes = self._filter_non_functional(functional_changes, client)
-            print(f"[CodeAnalyze] 过滤后: functional={len(functional_changes)}")
+            if filtered_count > 0:
+                print(f"[CodeAnalyze] 按 user_visible 过滤: {filtered_count} 条不可见项已移除")
 
-            # 第三步：三大类各自合并去重
+            # 第二步：合并去重（不再需要 _filter_non_functional 和 _label_visibility，
+            # user_visible 判断已在 per-group 阶段由 LLM 完成）
             print(f"[CodeAnalyze] 合并前: functional={len(functional_changes)}, removed={len(removed_features)}, ui={len(ui_updates)}")
+            merge_log = {}
+            merge_log["before_functional"] = [{"name": it.get("name"), "desc": it.get("description", "")[:60]} for it in functional_changes]
             functional_changes = self._merge_similar_items(functional_changes, "functional", client)
+            merge_log["after_functional"] = [{"name": it.get("name"), "desc": it.get("description", "")[:60]} for it in functional_changes]
+            merge_log["before_removed"] = [{"name": it.get("name"), "desc": it.get("description", "")[:60]} for it in removed_features]
             removed_features = self._merge_similar_items(removed_features, "removed", client)
+            merge_log["after_removed"] = [{"name": it.get("name"), "desc": it.get("description", "")[:60]} for it in removed_features]
             print(f"[CodeAnalyze] 合并后: functional={len(functional_changes)}, removed={len(removed_features)}")
+            with open(f"{self.task_dir}/merge_pipeline.json", 'w') as f:
+                json.dump(merge_log, f, ensure_ascii=False, indent=2)
 
-            # 第三步：对合并结果批量打 user_visible 标签
-            all_to_label = functional_changes + removed_features
-            if all_to_label:
-                labeled = self._label_visibility(all_to_label, client)
-                if labeled and len(labeled) == len(all_to_label):
-                    functional_changes = labeled[:len(functional_changes)]
-                    removed_features = labeled[len(functional_changes):]
+            # 不再需要 _label_visibility：user_visible 已在 per-group 阶段由 LLM 判断
+            # 合并结果中所有条目均为用户可见
 
             llm_result = {
                 "functional_changes": functional_changes,
@@ -570,6 +706,10 @@ class CodeAnalyzeService:
                 },
                 "llm_status": "success",
             }
+            # Save final result for debugging
+            with open(f"{self.task_dir}/llm_final_result.json", 'w') as f:
+                json.dump(llm_result, f, ensure_ascii=False, indent=2)
+            print(f"[CodeAnalyze] Final LLM result saved ({len(llm_result.get('functional_changes',[]))} functional, {len(llm_result.get('removed_features',[]))} removed, {len(llm_result.get('ui_updates',[]))} ui)")
             yield from self._emit_complete(llm_result)
 
         except concurrent.futures.TimeoutError:
@@ -655,16 +795,97 @@ class CodeAnalyzeService:
 
 
     def _merge_similar_items(self, items: list, category: str, client: LLMClient) -> list:
-        """语义去重：LLM 直接输出去重精简后的结果列表。
+        """三级合并流水线：目录聚类 → 堆内 LLM 合并 → 跨堆二次合并。
 
-        不依赖 LLM 选择"哪些合并"，而是要求 LLM 输出精简后的最终列表，
-        迫使 LLM 自行判断哪些该合并。
+        Level 1: 按 evidence_files 的共同目录前缀聚类，确保同一模块在一堆
+        Level 2: 每堆内调用 LLM 语义去重合并
+        Level 3: 不同堆如果有共用证据文件，跨堆再合一次
         """
         if len(items) <= 1:
             return items
 
+        # ---- Level 1: 目录聚类 ----
+        def _get_dir_key(item: dict) -> str:
+            """提取变更所属的页面/模块名作为聚类 key。
+
+            优先取 pages/ 或 components/ 后的第一段作为模块名，
+            page-logic/ 归一化为 pages/ 确保同一模块在同一堆。
+            没有则取倒数第二段目录名。
+            """
+            files = item.get("evidence_files") or []
+            if not files:
+                return "_other"
+            first = files[0]
+            # 将 page-logic 归一化为 pages
+            normalized = first.replace('/page-logic/', '/pages/')
+            for marker in ['/pages/', '/components/']:
+                idx = normalized.find(marker)
+                if idx != -1:
+                    rest = normalized[idx + len(marker):]
+                    module = rest.split('/')[0]
+                    return f"{normalized[:idx]}{marker}{module}"
+            # 没有 pages/components 标记，取倒数第二段
+            parts = normalized.split('/')
+            if len(parts) >= 2:
+                return "/".join(parts[:-1])
+            return parts[0]
+
+        clusters: dict[str, list] = {}
+        for item in items:
+            key = _get_dir_key(item)
+            if key not in clusters:
+                clusters[key] = []
+            clusters[key].append(item)
+
+        cluster_list = list(clusters.values())
+        # Log cluster detail
+        cluster_detail = []
+        for key, group in sorted(clusters.items()):
+            names = [it.get("name", "?")[:30] for it in group]
+            cluster_detail.append(f"    {key} ({len(group)} 条): {', '.join(names[:3])}{'...' if len(names)>3 else ''}")
+        print(f"[CodeAnalyze] 目录聚类: {len(items)} 条 → {len(cluster_list)} 堆")
+        for line in cluster_detail:
+            print(line)
+
+        if len(cluster_list) == 1:
+            # 只有一堆，直接 LLM 合并
+            merged = self._llm_merge_batch(cluster_list[0], client)
+            print(f"[CodeAnalyze] 单堆合并: {len(cluster_list[0])} → {len(merged)} 条")
+            return merged
+
+        # ---- Level 2: 每堆独立 LLM 合并 ----
+        print(f"[CodeAnalyze] Level 2 堆内合并开始...")
+        batch_results = []
+        for i, batch in enumerate(cluster_list):
+            if len(batch) <= 1:
+                batch_results.extend(batch)
+            else:
+                print(f"[CodeAnalyze]   堆 {i}: {len(batch)} 条")
+                merged_batch = self._llm_merge_batch(batch, client)
+                batch_results.extend(merged_batch)
+
+        # ---- Level 3: 全量二次合并 — 处理跨目录的相似条目（如多个页面的埋点） ----
+        # Level 2 堆内合并后总量通常 ≤ 50 条，LLM 可一次处理
+        # 不再依赖证据文件匹配，而是全局语义合并
+        if len(batch_results) <= 1:
+            return batch_results
+
+        if len(batch_results) <= 3:
+            print(f"[CodeAnalyze] Level 3 全量二次合并: 仅 {len(batch_results)} 条，跳过")
+            return batch_results
+
+        print(f"[CodeAnalyze] Level 3 全量二次合并: {len(batch_results)} 条 → ...")
+        final_merged = self._llm_merge_batch(batch_results, client)
+        print(f"[CodeAnalyze] Level 3 全量二次合并: {len(batch_results)} → {len(final_merged)} 条")
+        return final_merged
+
+    def _llm_merge_batch(self, batch: list, client: LLMClient) -> list:
+        """单批 LLM 语义合并。输入 batch，输出去重合并后的列表。"""
+        if len(batch) <= 1:
+            return batch
+
         entries = []
-        for i, it in enumerate(items):
+        for i, it in enumerate(batch):
             name = it.get("name", "")
             desc = it.get("description", "")
             entries.append(f"{i+1}. {name} — {desc}")
@@ -684,13 +905,14 @@ class CodeAnalyzeService:
 
 规则：
 - 将描述同一功能模块、description相近或有重合的条目合并为一条，重点关注名称相近的条目
+- **同类操作跨页面合并**：如果多个条目描述的是同类操作（如"新增埋点"、"新增埋点事件"、"新增XXX埋点"），即使它们在不同页面，也合并为一条，如"新增多处操作埋点"
 - 综合考虑 description 和名称判断，既不能漏掉相似条目，也不能误合并不同条目
 - 多个描述同一功能的条目合并为一条，一个条目最多只能参与合并一次，避免合并后出现两个条目中存在重复的描述
 - 合并后的 description 整合多条的核心信息，50-150 字，用自然语言表达
 - 合并后的名称重新提炼，15 字以内，动词开头
 - 合并后如果还有多个不同的条目，就输出多个"""
         try:
-            resp = client.chat(system=prompt, user="", temperature=0.0, max_tokens=4096, seed=42)
+            resp = client.chat(system=prompt, user="", temperature=0.0, max_tokens=8192, seed=42)
             print(f"[CodeAnalyze] 合并响应前200字: {resp[:200]}")
             result = json.loads(resp)
             if not isinstance(result, dict):
@@ -699,7 +921,7 @@ class CodeAnalyzeService:
             merged_list = result.get("items", [])
 
             if not merged_list:
-                return items
+                return batch
 
             # 映射回原始 item 的元数据
             merged = []
@@ -707,12 +929,11 @@ class CodeAnalyzeService:
                 merged_name = merged_item.get("name", "")
                 merged_desc = merged_item.get("description", "")
 
-                # 找原始 items 中名称最匹配的作为元数据基础
-                best_match = items[0]
+                # 找原始 batch 中名称最匹配的作为元数据基础
+                best_match = batch[0]
                 best_score = 0
-                for orig in items:
+                for orig in batch:
                     orig_name = orig.get("name", "")
-                    # 简单前缀匹配
                     if merged_name and orig_name and merged_name[:4] == orig_name[:4]:
                         score = len(set(merged_name) & set(orig_name))
                         if score > best_score:
@@ -722,7 +943,7 @@ class CodeAnalyzeService:
                 # 收集所有匹配原条目的 evidence_files 和 confidence
                 all_files = list(best_match.get("evidence_files", []))
                 max_conf = float(best_match.get("confidence", 0.5))
-                for orig in items:
+                for orig in batch:
                     orig_name = orig.get("name", "")
                     if merged_name and orig_name and (merged_name[:4] == orig_name[:4] or orig_name[:4] in merged_name):
                         all_files.extend(orig.get("evidence_files", []))
@@ -747,16 +968,16 @@ class CodeAnalyzeService:
                     "user_visible": True,
                 })
 
-            if len(merged) < len(items):
-                print(f"[CodeAnalyze] LLM合并: {len(items)} → {len(merged)} 条")
+            if len(merged) < len(batch):
+                print(f"[CodeAnalyze] LLM合并: {len(batch)} → {len(merged)} 条")
                 return merged
 
-            print(f"[CodeAnalyze] LLM 未合并，保留 {len(items)} 条")
-            return items
+            print(f"[CodeAnalyze] LLM 未合并，保留 {len(batch)} 条")
+            return batch
 
         except (json.JSONDecodeError, Exception) as e:
-            print(f"[CodeAnalyze] 语义合并失败 ({category}): {e}")
-            return items
+            print(f"[CodeAnalyze] 语义合并失败: {e}")
+            return batch
 
 
     def _label_visibility(self, items: list, client: LLMClient) -> list:
@@ -801,7 +1022,27 @@ class CodeAnalyzeService:
 
 
     def _filter_non_functional(self, items: list, client: LLMClient) -> list:
-        """过滤与平台业务功能无关的条目（常量定义、枚举、代码重构、工具函数等）。"""
+        """过滤与平台业务功能无关的条目。
+
+        分批处理（每批 ≤ 20 条），避免 LLM 处理超载。
+        """
+        if not items:
+            return items
+
+        # 分批处理，每批 ≤ 20 条
+        batch_size = 20
+        all_kept = []
+        for batch_start in range(0, len(items), batch_size):
+            batch = items[batch_start:batch_start + batch_size]
+            kept = self._filter_non_functional_batch(batch, client, batch_start)
+            all_kept.extend(kept)
+
+        if len(all_kept) < len(items):
+            print(f"[CodeAnalyze] 过滤非功能项: {len(items)} → {len(all_kept)} 条")
+        return all_kept
+
+    def _filter_non_functional_batch(self, items: list, client: LLMClient, offset: int = 0) -> list:
+        """单批 LLM 过滤。"""
         if not items:
             return items
 
@@ -836,7 +1077,7 @@ class CodeAnalyzeService:
 - 调整了工具函数、纯数据转换逻辑
 - 更新了注释、日志、格式化等非功能变更
 
-**核心判断原则：** 看描述是否指向一个**具体的业务功能变化**。如果是就保留，如果只是代码层面的技术调整就过滤。拿不准时归入 keep。"""
+**核心判断原则：** 看描述是否指向一个**具体的业务功能变化**。如果是就保留，如果只是代码层面的技术调整就过滤。**拿不准时不要默认归入 keep，应仔细按分类标准判断。**"""
         try:
             resp = client.chat(system=prompt, user="", temperature=0.0, max_tokens=2048, seed=42)
             result = json.loads(resp)

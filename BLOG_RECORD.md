@@ -1230,3 +1230,60 @@ def _build_preceding_sections_text(session, current_section):
 ### 改动范围
 
 `simple_generate()` 和 `generate_section()` 都改了，简单模式和中等模式都受益。TypeScript 零错误，Python import 正常。
+
+---
+
+## 7. 功能变更分析模块全面优化（2026-07-10）
+
+### 背景
+
+功能变更分析模块是 AI 中控台的核心模块之一，用于按时间段自动提取前端代码的功能变更。
+
+**之前的问题：**
+1. **提取质量差**：LLM 看不到 diff 内容，只看到第一个文件的前 50 行，导致描述模糊、不稳定
+2. **合并不稳定**：108 条一次性塞给 LLM，有时全部合并为 8 条（过度合并），有时一条都不合（108 条全保留）
+3. **过滤不彻底**：非功能变更（如"新增配额评估器键名"、"优化部门选择逻辑"）未过滤
+4. **git fetch 失败**：stale worktree 引用导致 `refusing to fetch`，bare repo 停留在旧 commit
+5. **提取遗漏**：默认只选了 `ml-data`，`ml-main` 的全局搜索等 42 个文件变更未进入分析
+6. **日志不实时**：`print()` 被 pipe 缓冲，看不到实时进度
+7. **取消不生效**：`request.is_disconnected()` 在 Flask 3.1 中不存在，导致 500 错误
+
+### 修复过程
+
+**Phase 1：分析问题**
+- 发现 AST 聚类出 145 个 group，但合并时 145 条全塞给 LLM → LLM 无法处理
+- 发现 `_get_dir_key` 取 `apps/algorithm/ml-data/src` 作为 key，所有文件归到同一堆
+- 发现 `_filter_non_functional` 一次性 108 条塞给 LLM → LLM 返回空，过滤失败
+- 发现 `_generate_diff` 的 `git diff` 用默认 `-U3`，上下文只有 3 行
+
+**Phase 2：提取 prompt 增强**
+- 输入从 `file_content`（第一文件前 50 行）改为 `diff_snippets`（每个文件的 git diff patch，含前后各 50 行上下文）
+- 新增 `signal_details`，传具体 API 路径、状态名、路由名等细节
+- `max_tokens` 从 4096 提升到 8192
+- `diffHunk` 截断从 1000 字符提升到 5000 字符
+- `git diff -U50` 替代默认 `-U3`
+
+**Phase 3：合并策略重写**
+- Level 1 目录聚类：按 `pages/xxx` 模块名聚类，`page-logic/` 归一化为 `pages/`
+- Level 2 堆内合并：每堆独立调用 LLM
+- Level 3 全量二次合并：全局语义合并，不再依赖证据文件匹配
+- 新增 prompt 规则：同类操作跨页面合并
+
+**Phase 4：过滤加强**
+- 明确列出反例（纯枚举/常量/类型定义变更、纯参数调整、代码重构/重命名）
+- 改"拿不准时归入 keep" → "拿不准时不要默认归入 keep"
+
+**Phase 5：基础设施修复**
+- git fetch 修复：`+refs/heads/* --force`，失败自动 re-clone
+- 日志实时化：`sys.stdout.reconfigure(line_buffering=True)` + 时间戳
+- 中间结果保存：per-group LLM、合并流水线、最终结果均保存到 `/tmp/analyze_debug/`
+- 前端路径默认值：增加 `ml-main`
+- 前端文件展示：最多 20 个，超出显示 "+N 个文件"
+
+### 关键教训
+
+1. **LLM 不能一次性处理太多条目**：分批处理（每批 ≤ 20 条）是必须的，目录聚类 + 分批合并效果远好于一次性处理
+2. **print 日志在 pipe 中会被缓冲**：`sys.stdout.reconfigure(line_buffering=True)` 解决
+3. **Flask 3.1 没有 `request.is_disconnected()`**：Generator 断开时 `BrokenPipeError` 自然触发，`finally` 块清理资源
+4. **前端路径选择影响分析范围**：默认只选 `ml-data` 导致 `ml-main` 的变更完全遗漏，这是配置问题不是代码问题
+5. **证据文件匹配不适合跨目录合并**：不同页面的相同操作（如埋点）不共用文件，需要全局语义合并

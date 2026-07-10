@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>方案对比 - 话题转换 UI</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5ff; padding: 40px; color: #1f2937; }
+  h1 { text-align: center; font-size: 24px; margin-bottom: 8px; color: #374151; }
+  .subtitle { text-align: center; color: #9ca3af; font-size: 14px; margin-bottom: 36px; }
+  .row { display: flex; gap: 24px; justify-content: center; flex-wrap: wrap; }
+  .card { background: #fff; border-radius: 16px; box-shadow: 0 4px 20px rgba(0,0,0,0.06); width: 380px; overflow: hidden; border: 1px solid #e5e7eb; display: flex; flex-direction: column; }
+  .card-header { padding: 16px 20px; border-bottom: 1px solid #f3f4f6; }
+  .card-header h2 { font-size: 15px; font-weight: 600; }
+  .card-header .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 10px; margin-top: 4px; }
+  .badge-a { background: #eef2ff; color: #6366f1; }
+  .badge-b { background: #fef3c7; color: #d97706; }
+  .badge-c { background: #ecfdf5; color: #059669; }
+  .card-body { padding: 16px 20px; flex: 1; }
+  .card-footer { padding: 12px 20px; border-top: 1px solid #f3f4f6; font-size: 12px; color: #6b7280; background: #fafafa; }
+  .card-footer .tag { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 11px; margin-right: 4px; }
+  .tag-pros { background: #d1fae5; color: #065f46; }
+  .tag-cons { background: #fce7f3; color: #9d174d; }
+
+  /* ── 方案 A: Steps 流水线 ── */
+  .steps-bar { display: flex; align-items: center; gap: 0; margin-bottom: 16px; padding: 8px 0; }
+  .step-item { display: flex; align-items: center; flex: 1; }
+  .step-circle { width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 12px; flex-shrink: 0; }
+  .step-done { background: #52c41a; color: #fff; }
+  .step-current { background: #6366f1; color: #fff; box-shadow: 0 0 0 3px rgba(99,102,241,0.2); }
+  .step-wait { background: #e5e7eb; color: #9ca3af; }
+  .step-label { font-size: 10px; text-align: center; margin-top: 4px; color: #6b7280; white-space: nowrap; }
+  .step-label.active { color: #6366f1; font-weight: 600; }
+  .step-connector { flex: 1; height: 2px; background: #e5e7eb; margin: 0 4px; margin-top: -16px; }
+  .step-connector.done { background: #52c41a; }
+
+  /* ── 方案 B: 话题标签条 ── */
+  .topic-tabs { display: flex; gap: 6px; margin-bottom: 16px; flex-wrap: wrap; }
+  .topic-tab { display: inline-flex; align-items: center; gap: 4px; padding: 5px 12px; border-radius: 20px; font-size: 12px; border: 1.5px solid #e5e7eb; background: #fff; cursor: default; transition: all 0.15s; }
+  .topic-tab.done { background: #f0fdf4; border-color: #86efac; color: #166534; }
+  .topic-tab.current { background: #eef2ff; border-color: #6366f1; color: #4338ca; font-weight: 600; box-shadow: 0 0 0 2px rgba(99,102,241,0.15); }
+  .topic-tab.wait { background: #f9fafb; border-color: #e5e7eb; color: #9ca3af; }
+  .topic-tab .num { font-size: 10px; opacity: 0.6; }
+
+  /* ── 方案 C: 时间线式 ── */
+  .timeline { position: relative; padding-left: 28px; }
+  .timeline::before { content: ''; position: absolute; left: 10px; top: 8px; bottom: 8px; width: 2px; background: #e5e7eb; }
+  .tl-section { position: relative; margin-bottom: 16px; }
+  .tl-section::before { content: ''; position: absolute; left: -22px; top: 6px; width: 12px; height: 12px; border-radius: 50%; background: #e5e7eb; }
+  .tl-section.done::before { background: #52c41a; border: 2px solid #bbf7d0; }
+  .tl-section.current::before { background: #6366f1; border: 2px solid #c7d2fe; box-shadow: 0 0 0 3px rgba(99,102,241,0.15); }
+  .tl-header { font-size: 13px; font-weight: 600; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
+  .tl-header .status-icon { font-size: 14px; }
+  .tl-msg { font-size: 13px; padding: 6px 10px; border-radius: 6px; margin: 4px 0 4px 0; }
+  .tl-msg.system { background: #f3f4f6; }
+  .tl-msg.user { background: #e8f4fd; text-align: right; }
+
+  /* ── 对话气泡（通用） ── */
+  .chat-msg { font-size: 13px; padding: 8px 12px; border-radius: 8px; margin-bottom: 6px; }
+  .chat-msg.system { background: #f5f5f5; }
+  .chat-msg.user { background: #e8f4fd; text-align: right; }
+  .chat-input { display: flex; gap: 8px; margin-top: 12px; }
+  .chat-input input { flex: 1; padding: 6px 12px; border: 1.5px solid #e5e7eb; border-radius: 8px; font-size: 13px; outline: none; }
+  .chat-input input:focus { border-color: #6366f1; }
+  .chat-input button { padding: 6px 16px; background: #6366f1; color: #fff; border: none; border-radius: 8px; font-size: 13px; cursor: default; }
+
+  /* 话题切换分隔线 */
+  .topic-divider { display: flex; align-items: center; gap: 8px; margin: 10px 0; }
+  .topic-divider hr { flex: 1; border: none; border-top: 1px dashed #d1d5db; }
+  .topic-divider .tag { font-size: 11px; padding: 2px 10px; border-radius: 10px; background: #f3e8ff; color: #7c3aed; white-space: nowrap; }
+</style>
+</head>
+<body>
+
+<h1>🎯 中等模式话题转换 UI 方案对比</h1>
+<p class="subtitle">当前 7 个话题共用同一个对话框，用户难以感知话题切换</p>
+
+<div class="row">
+
+  <!-- ──────────── 方案 A ──────────── -->
+  <div class="card">
+    <div class="card-header">
+      <h2>方案 A：Steps 流水线 + 分隔线</h2>
+      <span class="badge badge-a">✅ 已实现</span>
+    </div>
+    <div class="card-body">
+      <!-- Steps 进度条 -->
+      <div class="steps-bar">
+        <div style="flex:1;text-align:center">
+          <div class="step-circle step-done">✓</div>
+          <div class="step-label active">问题与方案</div>
+        </div>
+        <div class="step-connector done"></div>
+        <div style="flex:1;text-align:center">
+          <div class="step-circle step-done">✓</div>
+          <div class="step-label active">用户与场景</div>
+        </div>
+        <div class="step-connector done"></div>
+        <div style="flex:1;text-align:center">
+          <div class="step-circle step-current">3</div>
+          <div class="step-label active">核心功能</div>
+        </div>
+        <div class="step-connector"></div>
+        <div style="flex:1;text-align:center">
+          <div class="step-circle step-wait">4</div>
+          <div class="step-label">操作流程</div>
+        </div>
+        <div class="step-connector"></div>
+        <div style="flex:1;text-align:center">
+          <div class="step-circle step-wait">5</div>
+          <div class="step-label">边界约束</div>
+        </div>
+      </div>
+
+      <!-- 当前话题指示 -->
+      <div style="padding:5px 10px;background:#eef2ff;border-radius:6px;border-left:3px solid #6366f1;margin-bottom:12px;font-size:13px;font-weight:600;color:#6366f1">
+        💬 当前话题：核心功能（3/7）
+      </div>
+
+      <!-- 对话历史 -->
+      <div class="chat-msg system">请描述一下这个功能的核心操作流程是什么？</div>
+      <div class="chat-msg user">用户进入模型列表页，选择模型后点击"注册新版本"</div>
+      <div class="chat-msg system">了解了。那版本号是自动生成还是手动输入？</div>
+      <div class="chat-msg user">自动生成，规则是 v{major}.{minor}.{patch}</div>
+
+      <!-- 话题切换分隔线 -->
+      <div class="topic-divider">
+        <hr><span class="tag">🎯 进入话题：核心功能</span><hr>
+      </div>
+
+      <div class="chat-msg system" style="border-left:3px solid #6366f1;background:#f0f5ff">
+        👍 好的。接下来聊一下核心功能点。这个功能必须包含哪些核心能力？
+      </div>
+      <div class="chat-msg user">必须支持注册、版本对比和回滚三个能力</div>
+
+      <!-- 输入框 -->
+      <div class="chat-input">
+        <input placeholder="回答系统的问题..." value="还有灰度发布">
+        <button>发送</button>
+      </div>
+    </div>
+    <div class="card-footer">
+      <span class="tag tag-pros">优点</span> 进度一目了然，用户知道还剩多少话题
+      <span class="tag tag-cons">缺点</span> 7 步横向较挤，小屏可能换行
+    </div>
+  </div>
+
+  <!-- ──────────── 方案 B ──────────── -->
+  <div class="card">
+    <div class="card-header">
+      <h2>方案 B：话题标签条 + 卡片分组</h2>
+      <span class="badge badge-b">推荐</span>
+    </div>
+    <div class="card-body">
+      <!-- 话题标签条 -->
+      <div class="topic-tabs">
+        <span class="topic-tab done"><span class="num">①</span> 问题与方案</span>
+        <span class="topic-tab done"><span class="num">②</span> 用户与场景</span>
+        <span class="topic-tab current"><span class="num">③</span> 核心功能</span>
+        <span class="topic-tab wait"><span class="num">④</span> 操作流程</span>
+        <span class="topic-tab wait"><span class="num">⑤</span> 边界约束</span>
+        <span class="topic-tab wait"><span class="num">⑥</span> 非功能需求</span>
+        <span class="topic-tab wait"><span class="num">⑦</span> 依赖范围</span>
+      </div>
+
+      <!-- 当前话题卡片 -->
+      <div style="border:2px solid #6366f1;border-radius:12px;overflow:hidden;margin-bottom:12px;">
+        <div style="background:#eef2ff;padding:8px 14px;font-size:13px;font-weight:600;color:#4338ca;display:flex;justify-content:space-between;align-items:center">
+          <span>🎯 核心功能与优先级</span>
+          <span style="font-size:12px;font-weight:400;color:#6b7280">第 3 轮 · 共 2 条消息</span>
+        </div>
+        <div style="padding:10px 14px;background:#fff">
+          <div class="chat-msg system">这个功能必须包含哪些核心能力？</div>
+          <div class="chat-msg user">注册、版本对比、回滚，三个核心能力</div>
+          <div class="chat-msg system">这些能力的优先级怎么排？哪些是必须有的？</div>
+          <div class="chat-msg user">注册和版本对比是 P0，回滚是 P1</div>
+        </div>
+      </div>
+
+      <!-- 已完成话题（折叠/精简） -->
+      <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+        <div style="font-size:12px;padding:3px 8px;border-radius:6px;background:#f0fdf4;color:#166534;border:1px solid #86efac">
+          ✅ 问题与方案 · 3 轮
+        </div>
+        <div style="font-size:12px;padding:3px 8px;border-radius:6px;background:#f0fdf4;color:#166534;border:1px solid #86efac">
+          ✅ 用户与场景 · 2 轮
+        </div>
+      </div>
+
+      <!-- 输入框 -->
+      <div class="chat-input" style="margin-top:8px">
+        <input placeholder="回答当前话题的问题..." value="">
+        <button>发送</button>
+      </div>
+    </div>
+    <div class="card-footer">
+      <span class="tag tag-pros">优点</span> 话题切换最清晰，每话题独立卡片，已完成话题可折叠
+      <span class="tag tag-cons">缺点</span> 实现略复杂，需要管理话题分组的 UI 状态
+    </div>
+  </div>
+
+  <!-- ──────────── 方案 C ──────────── -->
+  <div class="card">
+    <div class="card-header">
+      <h2>方案 C：纵向时间线 + 可折叠</h2>
+      <span class="badge badge-c">轻量选择</span>
+    </div>
+    <div class="card-body">
+      <div class="timeline">
+        <!-- 已完成话题 -->
+        <div class="tl-section done">
+          <div class="tl-header">
+            <span class="status-icon">✅</span> 问题与方案
+            <span style="font-size:11px;font-weight:400;color:#6b7280">· 3 轮</span>
+          </div>
+          <div class="tl-msg system">当前遇到了什么问题？</div>
+          <div class="tl-msg user">模型版本管理混乱，回滚困难</div>
+        </div>
+
+        <div class="tl-section done">
+          <div class="tl-header">
+            <span class="status-icon">✅</span> 用户与场景
+            <span style="font-size:11px;font-weight:400;color:#6b7280">· 2 轮</span>
+          </div>
+          <div class="tl-msg system">主要面向哪些角色？</div>
+          <div class="tl-msg user">算法工程师和平台管理员</div>
+        </div>
+
+        <!-- 当前话题 -->
+        <div class="tl-section current">
+          <div class="tl-header">
+            <span class="status-icon">🎯</span> 核心功能与优先级
+            <span style="font-size:11px;font-weight:400;color:#6366f1">· 进行中</span>
+          </div>
+          <div class="tl-msg system">必须包含哪些核心能力？</div>
+          <div class="tl-msg user">注册、版本对比、回滚</div>
+          <div class="tl-msg system">优先级怎么排？</div>
+          <div class="tl-msg user">注册和版本对比 P0，回滚 P1</div>
+        </div>
+
+        <!-- 待开始话题 -->
+        <div class="tl-section" style="opacity:0.5">
+          <div class="tl-header">
+            <span class="status-icon">○</span> 操作流程
+          </div>
+        </div>
+        <div class="tl-section" style="opacity:0.5">
+          <div class="tl-header">
+            <span class="status-icon">○</span> 边界与约束
+          </div>
+        </div>
+      </div>
+
+      <!-- 输入框 -->
+      <div class="chat-input" style="margin-top:16px">
+        <input placeholder="继续回答..." value="">
+        <button>发送</button>
+      </div>
+    </div>
+    <div class="card-footer">
+      <span class="tag tag-pros">优点</span> 纵向不占宽度，小屏友好，天然适合时间线感
+      <span class="tag tag-cons">缺点</span> 消息分散在各话题下，不能统一滚动查看全部对话
+    </div>
+  </div>
+
+</div>
+
+<div style="max-width:1200px;margin:32px auto 0;padding:20px;background:#fff;border-radius:12px;border:1px solid #e5e7eb">
+  <h3 style="font-size:15px;margin-bottom:12px">📊 方案对比总结</h3>
+  <table style="width:100%;border-collapse:collapse;font-size:13px">
+    <tr style="border-bottom:1px solid #e5e7eb">
+      <th style="text-align:left;padding:8px 12px;background:#f9fafb">维度</th>
+      <th style="text-align:left;padding:8px 12px;background:#f9fafb">A: Steps 流水线</th>
+      <th style="text-align:left;padding:8px 12px;background:#f9fafb">B: 标签条 + 卡片分组</th>
+      <th style="text-align:left;padding:8px 12px;background:#f9fafb">C: 纵向时间线</th>
+    </tr>
+    <tr style="border-bottom:1px solid #f3f4f6">
+      <td style="padding:8px 12px;font-weight:500">话题切换感知</td>
+      <td style="padding:8px 12px">⭐⭐⭐ 分隔线 + 进度条</td>
+      <td style="padding:8px 12px">⭐⭐⭐⭐⭐ 独立卡片，切换最明显</td>
+      <td style="padding:8px 12px">⭐⭐⭐⭐ 时间线天然分段</td>
+    </tr>
+    <tr style="border-bottom:1px solid #f3f4f6">
+      <td style="padding:8px 12px;font-weight:500">进度感知</td>
+      <td style="padding:8px 12px">⭐⭐⭐⭐⭐ 7 步进度条</td>
+      <td style="padding:8px 12px">⭐⭐⭐⭐ 标签颜色 + 已完成标签</td>
+      <td style="padding:8px 12px">⭐⭐⭐⭐⭐ 纵向时间线一目了然</td>
+    </tr>
+    <tr style="border-bottom:1px solid #f3f4f6">
+      <td style="padding:8px 12px;font-weight:500">小屏适配</td>
+      <td style="padding:8px 12px">⭐⭐ 7 步横向可能换行</td>
+      <td style="padding:8px 12px">⭐⭐⭐⭐ 标签自动换行</td>
+      <td style="padding:8px 12px">⭐⭐⭐⭐⭐ 纵向，完全不受限</td>
+    </tr>
+    <tr style="border-bottom:1px solid #f3f4f6">
+      <td style="padding:8px 12px;font-weight:500">查看历史对话</td>
+      <td style="padding:8px 12px">⭐⭐⭐⭐⭐ 统一对话框，滚动查看全部</td>
+      <td style="padding:8px 12px">⭐⭐⭐⭐ 已完成可折叠，当前卡片展开</td>
+      <td style="padding:8px 12px">⭐⭐⭐ 消息分散在各话题下</td>
+    </tr>
+    <tr>
+      <td style="padding:8px 12px;font-weight:500">实现复杂度</td>
+      <td style="padding:8px 12px">低（已实现）</td>
+      <td style="padding:8px 12px">中（需话题分组逻辑）</td>
+      <td style="padding:8px 12px">中（需切换话题渲染模式）</td>
+    </tr>
+  </table>
+</div>
+
+</body>
+</html>

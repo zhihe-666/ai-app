@@ -5,6 +5,7 @@ import { ConfigProvider } from 'antd'
 import zhCN from 'antd/locale/zh_CN'
 import App from './App'
 import { LLMConfigProvider } from './components/LLMConfigProvider'
+import './chat-markdown.css'
 
 const theme = {
   token: {

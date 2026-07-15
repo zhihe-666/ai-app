@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-AI 项目管理中控台 — Flask + React 全栈应用，4 个核心模块：
+AI 项目管理中控台 — Flask + React 全栈应用，5 个核心模块：
 
 | 模块 | 路由 | 说明 |
 |------|------|------|
@@ -12,6 +12,7 @@ AI 项目管理中控台 — Flask + React 全栈应用，4 个核心模块：
 | 迭代数据统计 | `/iteration-stats` | 上传 xlsx → 解析统计 → 写入飞书多维表格 → 导出 xlsx |
 | AI 编程数据报告 | `/ai-measure` | 配置 Token/名单/时间 → SSE 生成报告 → 写入飞书文档 |
 | 无矩 2.0 知识库问答 | `/chat` | 问答代理到无矩 2.0 FastAPI 微服务 (SSE 流式) |
+| PRD 智能生成 | `/prd-gen` | 3 模式(简单/中等/深度) → SSE 生成 → 编辑/导出/原型 |
 
 ## 启动方式
 
@@ -43,7 +44,10 @@ backend/
 │   ├── meeting_todo.py          #   /api/meeting-todo/extract|generate|search
 │   ├── iteration_stats.py       #   /api/stats/upload|write-bitable|export|projects
 │   ├── ai_measure.py            #   /api/ai-measure/test-token|generate|write-to-feishu
-│   └── chat.py                  #   /api/chat/send (SSE 代理到无矩 2.0)
+│   ├── chat.py                  #   /api/chat/send (SSE+存历史) | /query | /conversations CRUD
+│   ├── kb_manage.py             #   /api/kb-manage/* (代理微服务 admin, sync 3模式+快照回退+图谱+PRD CRUD+组件注册表)
+│   ├── code_analyze.py          #   /api/code-analyze/start (SSE) | snapshot | export
+│   └── prd_gen.py               #   /api/prd/* (PRD 智能生成, 3模式+深度模式SSE闸口+原型端点)
 ├── services/                    # 业务逻辑
 │   ├── db.py                    #   SQLite 持久化 (user_config 表)
 │   ├── feishu_client.py         #   lark-cli subprocess 封装 (妙记/多维表格/文档)
@@ -55,6 +59,10 @@ backend/
 │   ├── skills_query_client.py   #   Skills API 封装
 │   ├── report_generator.py      #   报告编排器 (4 模块串行 + SSE 推送)
 │   ├── auth_middleware.py       #   LLM 配置认证中间件
+│   ├── deep_agents.py           #   深度模式 5 个 Agent(萃取/上下文/规格/撰写/原型)
+│   ├── deep_gates.py            #   深度模式 3 人工闸口(threading.Event 挂起/恢复)
+│   ├── validators.py            #   深度模式 6 校验器(Schema/Scope/Citation/Accept/Permission/Risk)
+│   ├── model_router.py          #   双模型路由(Agent2/3 pro, Agent1/4 flash)
 │   ├── token_config.py          #   Token 配置管理
 │   └── sse_helpers.py           #   SSE 事件流辅助函数
 ├── data/app.db                  # SQLite 数据库 (自动创建)
@@ -122,7 +130,11 @@ frontend/
 
 ### 4. 知识库问答 (`chat.py`)
 - 代理到无矩 2.0 FastAPI 微服务 (localhost:8000)
-- SSE 流式返回 token + sources
+- SSE 流式返回 token + sources，流式累积 answer/sources，`[DONE]` 时存历史到 `chat_sessions` 表
+- 问答历史 CRUD：`GET /conversations`（列表）、`GET /conversations/{id}`（详情）、`DELETE /conversations/{id}`（删单条）、`DELETE /conversations`（清空）
+- 非流式查询 `POST /api/chat/query`（对齐 T025 文档 2.2，返回 contexts）
+- 前端 Chat.tsx 左侧历史侧边栏 + ReactMarkdown 渲染回答（`chat-markdown.css` 样式）
+- 微服务配置共享：中控台 `backend/.env` 含 `DEEPSEEK_API_KEY`/`GL_TOKEN` 等同名环境变量，`start_microservice.sh` 加载后 export 给微服务进程
 
 ## 常用命令
 
@@ -143,6 +155,6 @@ npm run build                     # 生产构建
 ## 外部依赖
 
 - **`lark-cli`**: subprocess 调用, 用于飞书操作 (妙记/多维表格/文档/通讯录)
-- **无矩 2.0 知识问答**: localhost:8000 FastAPI 微服务, `/api/query/stream` SSE 端点
-- **OpenAI 兼容 LLM**: 通过环境变量或前端输入配置 API Key / Base URL / Model
-- **Playwright**: 可选, `playwright install chromium`
+- **无矩 2.0 知识问答**: localhost:8000 FastAPI 微服务, `/api/query/stream` SSE 端点。`start_microservice.sh` 加载中控台 `.env` 共享配置（`DEEPSEEK_API_KEY`/`GL_TOKEN` 等），默认微服务目录 `../ju`
+- **OpenAI 兼容 LLM**: 配置优先级 请求头 > DB(user_config 表) > `backend/.env`(DEFAULT_*)。前端"全局配置"弹窗可覆盖
+- **`backend/.env`**: 默认配置（DEFAULT_API_KEY/GIT_TOKEN + 微服务共享 DEEPSEEK_API_KEY/GL_TOKEN），对方零配置上手

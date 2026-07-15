@@ -101,9 +101,12 @@ def verify_config():
 
 @auth_bp.route('/api/auth/config', methods=['GET'])
 def get_config():
-    """获取已保存的 LLM 配置 + Git Token"""
+    """获取已保存的 LLM 配置 + Git Token
+
+    优先级：数据库 > 环境变量默认值（对方未配置时复用本地默认）
+    """
     saved = get_user_config()
-    if saved:
+    if saved and saved.get("api_key"):
         return jsonify({
             "configured": True,
             "provider_name": saved.get("provider_name", ""),
@@ -111,6 +114,17 @@ def get_config():
             "model": saved.get("model", ""),
             "api_key": saved.get("api_key", ""),
             "git_token": saved.get("git_token", ""),
+        })
+    # 兜底：环境变量默认配置
+    default_api_key = os.environ.get("DEFAULT_API_KEY", "")
+    if default_api_key:
+        return jsonify({
+            "configured": True,
+            "provider_name": os.environ.get("DEFAULT_PROVIDER", ""),
+            "base_url": os.environ.get("DEFAULT_BASE_URL", "https://api.openai.com/v1"),
+            "model": os.environ.get("DEFAULT_MODEL", "gpt-4o"),
+            "api_key": default_api_key,
+            "git_token": os.environ.get("DEFAULT_GIT_TOKEN", ""),
         })
     return jsonify({"configured": False})
 

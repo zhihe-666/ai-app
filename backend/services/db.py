@@ -141,6 +141,43 @@ def init_db():
             ON prd_chat_messages (session_id, round)
         ''')
 
+        # ── 知识库问答历史 ──
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS chat_sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                query TEXT NOT NULL DEFAULT '',
+                answer TEXT NOT NULL DEFAULT '',
+                sources TEXT NOT NULL DEFAULT '[]',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.execute('''
+            CREATE INDEX IF NOT EXISTS idx_chat_sessions_created
+            ON chat_sessions (created_at DESC)
+        ''')
+
+        # ── Schema migration：给旧表补缺失列（CREATE TABLE IF NOT EXISTS 不改已存在的表）──
+        def _has_column(table: str, col: str) -> bool:
+            cols = [r[1] for r in conn.execute(f'PRAGMA table_info({table})').fetchall()]
+            return col in cols
+
+        if not _has_column('user_config', 'git_token'):
+            conn.execute('ALTER TABLE user_config ADD COLUMN git_token TEXT NOT NULL DEFAULT \'\'')
+            print('[DB] migration: user_config 新增 git_token 列')
+
+        # PRD 深度模式：状态机阶段 + 各 Agent 产出（JSON）
+        if not _has_column('prd_sessions', 'deep_state'):
+            conn.execute('ALTER TABLE prd_sessions ADD COLUMN deep_state TEXT NOT NULL DEFAULT \'init\'')
+            print('[DB] migration: prd_sessions 新增 deep_state 列')
+        if not _has_column('prd_sessions', 'deep_artifacts'):
+            conn.execute('ALTER TABLE prd_sessions ADD COLUMN deep_artifacts TEXT NOT NULL DEFAULT \'{}\'')
+            print('[DB] migration: prd_sessions 新增 deep_artifacts 列')
+        # 飞书文档导出 URL（export_to_feishu 已用，旧库可能缺）
+        if not _has_column('prd_sessions', 'feishu_doc_url'):
+            conn.execute('ALTER TABLE prd_sessions ADD COLUMN feishu_doc_url TEXT NOT NULL DEFAULT \'\'')
+            print('[DB] migration: prd_sessions 新增 feishu_doc_url 列')
+
         conn.commit()
     finally:
         conn.close()
@@ -344,7 +381,7 @@ def update_prd_session(session_id: str, **kwargs) -> dict | None:
         return get_prd_session(session_id)
 
     # JSON 序列化
-    for json_field in ('collected_info', 'minutes_extract', 'outline', 'section_contents'):
+    for json_field in ('collected_info', 'minutes_extract', 'outline', 'section_contents', 'deep_artifacts'):
         val = kwargs.get(json_field)
         if val is not None and isinstance(val, (dict, list)):
             kwargs[json_field] = json.dumps(val, ensure_ascii=False)
@@ -506,3 +543,77 @@ def get_chat_messages(session_id: str) -> list[dict]:
         (session_id,)
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ── chat_sessions（知识库问答历史）──
+
+
+def save_chat_session(query: str, answer: str, sources: list) -> dict:
+    """保存一条知识库问答历史
+
+    Args:
+        query: 用户问题
+        answer: LLM 完整回答
+        sources: 引用来源列表
+    Returns:
+        dict: {id, title, created_at}
+
+    Note: 直接建独立连接，不依赖 Flask g 对象（流式 generator 在请求上下文外执行，g 失效）。
+    """
+    session_id = str(uuid.uuid4())
+    # title 取 query 前 30 字
+    title = query[:30] + ('…' if len(query) > 30 else '')
+    conn = _connect()
+    try:
+        conn.execute('''
+            INSERT INTO chat_sessions (id, title, query, answer, sources, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (session_id, title, query, answer, json.dumps(sources, ensure_ascii=False), _now()))
+        conn.commit()
+    finally:
+        conn.close()
+    return {'id': session_id, 'title': title, 'created_at': _now()}
+
+
+def list_chat_sessions(limit: int = 50) -> list[dict]:
+    """列出问答历史（按时间倒序）"""
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT id, title, query, created_at FROM chat_sessions '
+        'ORDER BY created_at DESC, id DESC LIMIT ?',
+        (limit,)
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_chat_session(session_id: str) -> dict | None:
+    """获取单条问答历史详情（含 answer 和 sources）"""
+    conn = get_db()
+    row = conn.execute(
+        'SELECT id, title, query, answer, sources, created_at FROM chat_sessions WHERE id = ?',
+        (session_id,)
+    ).fetchone()
+    if row:
+        d = dict(row)
+        try:
+            d['sources'] = json.loads(d.get('sources') or '[]')
+        except json.JSONDecodeError:
+            d['sources'] = []
+        return d
+    return None
+
+
+def delete_chat_session(session_id: str) -> bool:
+    """删除单条问答历史"""
+    conn = get_db()
+    cur = conn.execute('DELETE FROM chat_sessions WHERE id = ?', (session_id,))
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def clear_chat_sessions() -> int:
+    """清空所有问答历史，返回删除条数"""
+    conn = get_db()
+    cur = conn.execute('DELETE FROM chat_sessions')
+    conn.commit()
+    return cur.rowcount

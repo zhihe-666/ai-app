@@ -13,13 +13,16 @@ import {
 import {
   DatabaseOutlined, FileSearchOutlined, CloudUploadOutlined,
   SyncOutlined, DeleteOutlined, EyeOutlined, FileAddOutlined,
-  UploadOutlined, LinkOutlined,
+  UploadOutlined, LinkOutlined, FileTextOutlined,
 } from '@ant-design/icons'
-import type { Collection, BrowseDoc, DocDetail, BrowseResponse } from '../api/kbManage'
+import type { Collection, BrowseDoc, DocDetail, BrowseResponse, PRDInfo, PRDDetail } from '../api/kbManage'
 import {
   getCollections, browseCollection, getDocument, importText, importFile,
   deleteDocument, triggerSync, getSyncStatus, getSqliteTables,
+  listPRDs, getPRDDetail, deletePRD, createPRD,
 } from '../api/kbManage'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 
 const { Title, Text } = Typography
 const { Dragger } = Upload
@@ -78,6 +81,19 @@ export default function KbManage() {
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [drawerLoading, setDrawerLoading] = useState(false)
 
+  // ── PRD 管理 ──
+  const [prdList, setPrdList] = useState<PRDInfo[]>([])
+  const [prdListLoading, setPrdListLoading] = useState(false)
+  const [prdListTotal, setPrdListTotal] = useState(0)
+  const [prdSearchKeyword, setPrdSearchKeyword] = useState('')
+  const [prdSearchStatus, setPrdSearchStatus] = useState('')
+  const [prdDetail, setPrdDetail] = useState<PRDDetail | null>(null)
+  const [prdDetailOpen, setPrdDetailOpen] = useState(false)
+  const [prdPage, setPrdPage] = useState(1)
+  const [importPRDModal, setImportPRDModal] = useState(false)
+  const [importPRDForm, setImportPRDForm] = useState({ title: '', content: '', author: '', version: '1.0', status: 'draft', summary: '', related_modules: '', feature_scope: '' })
+  const [importingPRD, setImportingPRD] = useState(false)
+
   // ── Tab 3: 导入 ──
   const [textTitle, setTextTitle] = useState('')
   const [textContent, setTextContent] = useState('')
@@ -88,14 +104,13 @@ export default function KbManage() {
   const [fileMeta, setFileMeta] = useState('')
   const [importingFile, setImportingFile] = useState(false)
 
-  // ── Tab 4: 同步 ──
-  const SYNC_MODES = [
-    { key: 'code', label: '仅代码同步', time: '~45s', dryRun: false, rebuildCore: false, rebuildWiki: false },
-    { key: 'core', label: '代码 + 核心KB', time: '~3min', dryRun: false, rebuildCore: true, rebuildWiki: false },
-    { key: 'wiki', label: '代码 + Wiki', time: '~5min', dryRun: false, rebuildCore: false, rebuildWiki: true },
-    { key: 'full', label: '全量更新', time: '~8min', dryRun: false, rebuildCore: true, rebuildWiki: true },
+  // ── Tab 4: 同步（T025 3 模式）──
+  const SYNC_MODES: { key: 'backend' | 'frontend' | 'full'; label: string; time: string; desc: string }[] = [
+    { key: 'backend', label: '后端同步', time: '~中', desc: 'Java GitLab sync + JavaDoc，支持 dry_run' },
+    { key: 'frontend', label: '前端同步', time: '~长', desc: 'graphify + 提取器 + frontend_source 指纹增量 + DeepSeek 摘要重生' },
+    { key: 'full', label: '全量同步', time: '~最长', desc: '前后端增量 + 核心 KB 重建 + wiki 重编 + linker + synthesizers + DeepSeek 重生摘要/指南/module_doc' },
   ]
-  const [syncMode, setSyncMode] = useState('code')
+  const [syncMode, setSyncMode] = useState<'backend' | 'frontend' | 'full'>('backend')
   const [syncing, setSyncing] = useState(false)
   const [syncTaskId, setSyncTaskId] = useState<number | null>(null)
   const [syncResult, setSyncResult] = useState<string | null>(null)
@@ -105,10 +120,11 @@ export default function KbManage() {
   const KB_COMPOSITION = [
     { data: 'code_method', update: '增量同步', switch: '默认（无开关）' },
     { data: 'code_class', update: '增量同步', switch: '默认（无开关）' },
-    { data: 'tech_kb', update: '全量重建', switch: 'rebuild_core' },
-    { data: 'ops_kb', update: '全量重建', switch: 'rebuild_core' },
-    { data: 'business_kb', update: '全量重建', switch: 'rebuild_core' },
-    { data: 'wiki_kb', update: '全量重编', switch: 'rebuild_wiki' },
+    { data: 'code_frontend', update: '前端同步', switch: 'frontend 模式' },
+    { data: 'tech_kb', update: '全量重建', switch: 'full 模式' },
+    { data: 'ops_kb', update: '全量重建', switch: 'full 模式' },
+    { data: 'business_kb', update: '全量重建', switch: 'full 模式' },
+    { data: 'wiki_kb', update: '全量重编', switch: 'full 模式' },
     { data: 'manual_kb', update: '手动导入', switch: '不参与同步' },
   ]
 
@@ -193,6 +209,67 @@ export default function KbManage() {
     })
   }, [browseCollectionName, loadBrowse])
 
+  // ── PRD 管理 ──
+  const loadPRDList = async (page = 1) => {
+    setPrdListLoading(true)
+    setPrdPage(page)
+    try {
+      const res = await listPRDs(page, 10, prdSearchKeyword, prdSearchStatus)
+      setPrdList(res.items || [])
+      setPrdListTotal(res.total || 0)
+    } catch { setPrdList([]) }
+    finally { setPrdListLoading(false) }
+  }
+
+  const handleOpenPRDDetail = async (prdId: string) => {
+    try {
+      const detail = await getPRDDetail(prdId)
+      setPrdDetail(detail)
+      setPrdDetailOpen(true)
+    } catch (e: any) {
+      message.error(e?.response?.data?.error || e?.message || '获取 PRD 详情失败')
+    }
+  }
+
+  const handleImportPRD = async () => {
+    const f = importPRDForm
+    if (!f.title.trim()) { message.warning('请输入 PRD 标题'); return }
+    setImportingPRD(true)
+    try {
+      await createPRD({
+        title: f.title,
+        content: f.content,
+        author: f.author,
+        version: f.version || '1.0',
+        status: f.status as any,
+        summary: f.summary,
+        related_modules: f.related_modules ? f.related_modules.split(/[,，、]/).map((s: string) => s.trim()).filter(Boolean) : [],
+        feature_scope: f.feature_scope ? f.feature_scope.split(/[,，、]/).map((s: string) => s.trim()).filter(Boolean) : [],
+      })
+      message.success('PRD 导入成功')
+      setImportPRDModal(false)
+      setImportPRDForm({ title: '', content: '', author: '', version: '1.0', status: 'draft', summary: '', related_modules: '', feature_scope: '' })
+      loadPRDList(1)
+    } catch (e: any) {
+      message.error(e?.response?.data?.error || e?.message || '导入失败')
+    } finally { setImportingPRD(false) }
+  }
+
+  const handleDeletePRD = (prdId: string, title: string) => {
+    Modal.confirm({
+      title: '确认删除',
+      content: `确定要删除 PRD「${title}」吗？SQLite 记录和 Chroma 向量将同时清理。`,
+      okText: '删除', okType: 'danger', cancelText: '取消',
+      onOk: async () => {
+        try {
+          await deletePRD(prdId)
+          message.success('PRD 已删除')
+          loadPRDList(prdPage)
+        } catch (e: any) { message.error(e?.response?.data?.error || e?.message || '删除失败') }
+      },
+    })
+  }
+
   // ── 导入文本 ──
   const handleImportText = useCallback(async () => {
     if (!textTitle.trim() || !textContent.trim()) {
@@ -240,16 +317,16 @@ export default function KbManage() {
     }
   }, [fileList, fileTitle, fileMeta, loadOverview])
 
-  // ── 触发同步 ──
+  // ── 触发同步（T025 3 模式）──
   const handleSync = useCallback(async (asDryRun: boolean) => {
-    const mode = SYNC_MODES.find(m => m.key === syncMode)!
+    const mode = syncMode  // 'backend' | 'frontend' | 'full'
     setSyncing(true)
     setSyncTaskId(null)
     setSyncResult(null)
     try {
-      const result = await triggerSync(asDryRun, mode.rebuildCore, mode.rebuildWiki)
+      const result = await triggerSync(mode, asDryRun)
       setSyncTaskId(result.task_id)
-      message.success(`${asDryRun ? '差异预览' : '同步'}任务已启动（ID: ${result.task_id}）`)
+      message.success(`${asDryRun ? '差异预览' : '同步'}任务已启动（${mode} 模式，ID: ${result.task_id}）`)
     } catch (err: any) {
       message.error(err?.response?.data?.error || err?.message || '触发失败')
       setSyncing(false)
@@ -257,14 +334,14 @@ export default function KbManage() {
   }, [syncMode])
 
   // ── 轮询状态 → 进度文本 ──
-  const syncProgressText = (status: any): string => {
+  const syncProgressText = (status: any, mode: string): string => {
     if (!status) return ''
     if (status.status === 'success' || status.status === 'failed') return '处理完成'
-    // 根据后端 result_summary 或 status 推断进度
     const s = (status.result_summary || '').toLowerCase()
-    if (s.includes('rebuild_core')) return '重建核心 KB 中…'
-    if (s.includes('rebuild_wiki') || s.includes('wiki')) return '重编 Wiki 中…'
-    return '代码同步中…'
+    if (mode === 'frontend') return '前端同步中（graphify + 提取器 + 摘要重生）…'
+    if (mode === 'full') return '全量同步中（重建 + 重编 + DeepSeek 重生）…'
+    if (s.includes('snapshot')) return '创建快照中…'
+    return '后端同步中…'
   }
 
   // ── 轮询同步状态 ──
@@ -515,14 +592,17 @@ export default function KbManage() {
                 {/* 模式选择 + 操作 */}
                 <Card size="small">
                   <Space direction="vertical" style={{ width: '100%' }} size="middle">
-                    <Text strong><SyncOutlined /> 同步模式</Text>
+                    <Text strong><SyncOutlined /> 同步模式（T025 3 模式）</Text>
                     {SYNC_MODES.map(m => (
-                      <div key={m.key} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                        <input type="radio" name="syncMode" checked={syncMode === m.key}
-                          onChange={() => setSyncMode(m.key)}
-                          style={{ accentColor: '#6366f1', width: 16, height: 16 }} />
-                        <Text>{m.label}</Text>
-                        <Tag>{m.time}</Tag>
+                      <div key={m.key} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, flexDirection: 'column' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                          <input type="radio" name="syncMode" checked={syncMode === m.key}
+                            onChange={() => setSyncMode(m.key)}
+                            style={{ accentColor: '#6366f1', width: 16, height: 16 }} />
+                          <Text>{m.label}</Text>
+                          <Tag>{m.time}</Tag>
+                        </div>
+                        <Text type="secondary" style={{ fontSize: 12, paddingLeft: 24 }}>{m.desc}</Text>
                       </div>
                     ))}
                     <div style={{ display: 'flex', gap: 8, paddingTop: 4 }}>
@@ -531,11 +611,16 @@ export default function KbManage() {
                         style={{ background: '#6366f1', borderColor: '#6366f1' }}>
                         执行{syncTaskId ? '中' : '同步'}
                       </Button>
-                      <Button icon={<FileSearchOutlined />} onClick={() => handleSync(true)}>
+                      <Button icon={<FileSearchOutlined />} onClick={() => handleSync(true)}
+                        disabled={syncMode !== 'backend'}
+                        title="dry-run 仅 backend 模式支持">
                         dry-run 预览差异
                       </Button>
                       {syncTaskId && <Text code>任务 ID: {syncTaskId}</Text>}
                     </div>
+                    <Text type="secondary" style={{ fontSize: 11 }}>
+                      非 dry-run 模式同步前自动创建快照，可用快照管理功能回退
+                    </Text>
                   </Space>
                 </Card>
 
@@ -573,8 +658,133 @@ export default function KbManage() {
               </div>
             ),
           },
+          // ── Tab 5: PRD 管理 ──
+          {
+            key: 'prd',
+            label: <span><FileTextOutlined /> 历史 PRD</span>,
+            children: (
+              <div>
+                <div style={{ marginBottom: 12, display: 'flex', gap: 8 }}>
+                  <Input.Search placeholder="搜索 PRD 标题…" allowClear style={{ width: 240 }}
+                    value={prdSearchKeyword} onChange={e => setPrdSearchKeyword(e.target.value)}
+                    onSearch={() => loadPRDList(1)} />
+                  <Select style={{ width: 110 }} value={prdSearchStatus} onChange={v => { setPrdSearchStatus(v); loadPRDList(1) }} allowClear placeholder="状态">
+                    <Select.Option value="">全部</Select.Option>
+                    <Select.Option value="draft">草稿</Select.Option>
+                    <Select.Option value="review">评审中</Select.Option>
+                    <Select.Option value="approved">已通过</Select.Option>
+                    <Select.Option value="archived">已归档</Select.Option>
+                  </Select>
+                  <Button type="primary" icon={<FileAddOutlined />} onClick={() => setImportPRDModal(true)} style={{ background: '#6366f1', borderColor: '#6366f1' }}>导入 PRD</Button>
+                  <Button icon={<SyncOutlined />} onClick={() => loadPRDList(prdPage)}>刷新</Button>
+                </div>
+                {prdList.length === 0 && !prdListLoading ? (
+                  <Card><Empty description="暂无历史 PRD，在 PRD 生成工作台中完成的 PRD 可保存到此" /></Card>
+                ) : (
+                  <Table
+                    dataSource={prdList} rowKey="prd_id" loading={prdListLoading} size="small"
+                    pagination={{ current: prdPage, total: prdListTotal, pageSize: 10, onChange: loadPRDList }}
+                    columns={[
+                      { title: '标题', dataIndex: 'title', key: 'title', ellipsis: true,
+                        render: (t: string, r: PRDInfo) => <a onClick={() => handleOpenPRDDetail(r.prd_id)}>{t}</a> },
+                      { title: '状态', dataIndex: 'status', key: 'status', width: 80,
+                        render: (s: string) => {
+                          const c: Record<string, string> = { draft: 'default', review: 'processing', approved: 'success', archived: 'default' }
+                          return <Tag color={c[s] || 'default'}>{s}</Tag>
+                        },
+                      },
+                      { title: '版本', dataIndex: 'version', key: 'version', width: 60 },
+                      { title: '作者', dataIndex: 'author', key: 'author', width: 80, ellipsis: true },
+                      { title: '创建时间', dataIndex: 'created_at', key: 'created_at', width: 100,
+                        render: (t: string) => t?.slice(0, 10) || '-' },
+                      { title: '操作', key: 'action', width: 60,
+                        render: (_: any, r: PRDInfo) => <Button size="small" danger onClick={() => handleDeletePRD(r.prd_id, r.title)}>删除</Button> },
+                    ]}
+                  />
+                )}
+              </div>
+            ),
+          },
         ]} />
       </div>
+
+      {/* ── 导入 PRD Modal ── */}
+      <Modal title="导入历史 PRD" open={importPRDModal} onCancel={() => setImportPRDModal(false)}
+        footer={<Space><Button onClick={() => setImportPRDModal(false)}>取消</Button><Button type="primary" loading={importingPRD} onClick={handleImportPRD} style={{ background: '#6366f1', borderColor: '#6366f1' }}>导入</Button></Space>}
+        width={640}
+      >
+        <Space direction="vertical" style={{ width: '100%' }} size="small">
+          <div><Text strong>标题 *</Text><Input value={importPRDForm.title} onChange={e => setImportPRDForm(p => ({ ...p, title: e.target.value }))} placeholder="PRD 标题" /></div>
+          <div>
+            <Text strong>内容（Markdown）</Text>
+            <Upload.Dragger
+              accept=".md,.txt"
+              showUploadList={false}
+              beforeUpload={(file) => {
+                const reader = new FileReader()
+                reader.onload = (e) => {
+                  const text = e.target?.result as string || ''
+                  setImportPRDForm(prev => {
+                    const title = prev.title || file.name.replace(/\.(md|txt)$/i, '')
+                    return { ...prev, content: text, title }
+                  })
+                }
+                reader.readAsText(file)
+                return false
+              }}
+              style={{ marginBottom: 8 }}
+            >
+              <p className="ant-upload-drag-icon"><UploadOutlined /></p>
+              <p>拖拽 .md / .txt 文件到此处，或点击选择</p>
+              <p style={{ fontSize: 12, color: '#999' }}>文件内容将自动填入下方编辑器</p>
+            </Upload.Dragger>
+            <TextArea rows={8} value={importPRDForm.content} onChange={e => setImportPRDForm(p => ({ ...p, content: e.target.value }))} placeholder="PRD 全文 Markdown…" />
+          </div>
+          <div style={{ display: 'flex', gap: 12 }}>
+            <div style={{ flex: 1 }}><Text>作者</Text><Input value={importPRDForm.author} onChange={e => setImportPRDForm(p => ({ ...p, author: e.target.value }))} /></div>
+            <div style={{ flex: 1 }}><Text>版本</Text><Input value={importPRDForm.version} onChange={e => setImportPRDForm(p => ({ ...p, version: e.target.value }))} /></div>
+            <div style={{ flex: 1 }}><Text>状态</Text>
+              <Select value={importPRDForm.status} onChange={v => setImportPRDForm(p => ({ ...p, status: v }))} style={{ width: '100%' }}>
+                <Select.Option value="draft">草稿</Select.Option>
+                <Select.Option value="review">评审中</Select.Option>
+                <Select.Option value="approved">已通过</Select.Option>
+                <Select.Option value="archived">已归档</Select.Option>
+              </Select>
+            </div>
+          </div>
+          <div><Text>摘要（用于向量检索）</Text><Input value={importPRDForm.summary} onChange={e => setImportPRDForm(p => ({ ...p, summary: e.target.value }))} placeholder="简洁的功能概述，30-50 字最佳" /></div>
+          <div><Text>关联模块（逗号分隔）</Text><Input value={importPRDForm.related_modules} onChange={e => setImportPRDForm(p => ({ ...p, related_modules: e.target.value }))} placeholder="集群配置管理, 集群部署管理" /></div>
+          <div><Text>功能范围（逗号分隔）</Text><Input value={importPRDForm.feature_scope} onChange={e => setImportPRDForm(p => ({ ...p, feature_scope: e.target.value }))} placeholder="灰度发布, 配置管理" /></div>
+        </Space>
+      </Modal>
+
+      {/* ── PRD 详情 Modal ── */}
+      <Modal
+        title={prdDetail?.title || 'PRD 详情'}
+        open={prdDetailOpen}
+        onCancel={() => setPrdDetailOpen(false)}
+        footer={null}
+        width={800}
+      >
+        {prdDetail ? (
+          <Space direction="vertical" style={{ width: '100%' }}>
+            <Space>
+              <Tag>{prdDetail.status}</Tag>
+              <Text type="secondary">v{prdDetail.version} | {prdDetail.author} | {prdDetail.created_at?.slice(0, 10)}</Text>
+            </Space>
+            {prdDetail.related_modules && prdDetail.related_modules.length > 0 && (
+              <Space wrap>{prdDetail.related_modules.map(m => <Tag key={m}>{m}</Tag>)}</Space>
+            )}
+            {prdDetail.summary && <Alert type="info" showIcon message={prdDetail.summary} />}
+            <Divider />
+            <div style={{ maxHeight: 500, overflow: 'auto', lineHeight: 1.8 }}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {(prdDetail.content || '').replace(/\\n/g, '\n')}
+              </ReactMarkdown>
+            </div>
+          </Space>
+        ) : <Spin />}
+      </Modal>
 
       {/* ── 文档全文 Drawer ── */}
       <Drawer

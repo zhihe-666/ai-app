@@ -12,7 +12,7 @@ import { streamRequest } from '../utils/sse'
 
 export interface PRDSession {
   sessionId: string
-  mode: 'simple' | 'medium'
+  mode: 'simple' | 'medium' | 'deep'
   status: 'init' | 'chatting' | 'writing' | 'done'
 }
 
@@ -84,6 +84,47 @@ export interface SectionCallbacks {
   onComplete?: (data: { sessionId: string }) => void
 }
 
+// ── 深度模式类型 ──
+
+export interface AgentCompleteEvent {
+  agent: string
+  data: any
+  message?: string
+}
+
+export interface GateEvent {
+  gate: 'conflict' | 'impact' | 'spec' | 'prototype' | 'agent1_review'
+  conflicts?: any[]
+  impact_warnings?: any[]
+  features?: any[]
+  requirements?: any
+  gaps?: string[]
+  message?: string
+}
+
+export interface ValidationIssue {
+  level: 'error' | 'warn'
+  field: string
+  message: string
+  action: string
+}
+
+export interface ValidationEvent {
+  stage?: string
+  validator?: string
+  issues: ValidationIssue[]
+  retry?: boolean
+}
+
+export interface DeepCallbacks {
+  onProgress?: (data: any) => void
+  onAgentComplete?: (data: AgentCompleteEvent) => void
+  onGate?: (data: GateEvent) => void
+  onValidation?: (data: ValidationEvent) => void
+  onComplete?: (data: { sessionId: string; message: string; has_prd?: boolean }) => void
+  onError?: (data: { message: string }) => void
+}
+
 // ── HTTP 工具 ──
 
 function getHeaders(): Record<string, string> {
@@ -128,7 +169,7 @@ async function get_<T>(path: string): Promise<T> {
 // ── API 函数 ──
 
 /** 1. 创建会话 */
-export async function createSession(mode: 'simple' | 'medium', userInput: string): Promise<PRDSession> {
+export async function createSession(mode: 'simple' | 'medium' | 'deep', userInput: string): Promise<PRDSession> {
   return post('/sessions', { mode, userInput })
 }
 
@@ -137,10 +178,11 @@ export async function simpleGenerate(
   sessionId: string,
   callbacks: SectionCallbacks,
   signal?: AbortSignal,
+  ragEnabled: boolean = true,
 ): Promise<void> {
   await streamRequest(
     `/prd/sessions/${sessionId}/simple-generate`,
-    {},
+    { rag_enabled: ragEnabled },
     {
       onProgress: (data) => callbacks.onProgress?.(data as SectionEvent),
       onSectionComplete: (data) => callbacks.onSectionComplete?.(data as SectionCompleteEvent),
@@ -149,6 +191,43 @@ export async function simpleGenerate(
     },
     signal,
   )
+}
+
+/** 2b. 深度模式 SSE 生成（4 Agent + 3 闸口） */
+export async function deepGenerate(
+  sessionId: string,
+  callbacks: DeepCallbacks,
+  signal?: AbortSignal,
+  ragEnabled: boolean = true,
+): Promise<void> {
+  await streamRequest(
+    `/prd/sessions/${sessionId}/deep-generate`,
+    { rag_enabled: ragEnabled },
+    {
+      onProgress: (data) => callbacks.onProgress?.(data),
+      onAgentComplete: (data) => callbacks.onAgentComplete?.(data as AgentCompleteEvent),
+      onGate: (data) => callbacks.onGate?.(data as GateEvent),
+      onValidation: (data) => callbacks.onValidation?.(data as ValidationEvent),
+      onComplete: (data) => callbacks.onComplete?.(data as any),
+      onError: (data) => callbacks.onError?.(data as { message: string }),
+    },
+    signal,
+  )
+}
+
+/** 2c. 深度模式人工闸口审批 */
+export async function approveGate(
+  sessionId: string,
+  gate: 'conflict' | 'impact' | 'spec' | 'prototype' | 'agent1_review',
+  approved: boolean,
+  modifications?: string,
+): Promise<{ ok: boolean; gate: string; approved: boolean }> {
+  return post(`/sessions/${sessionId}/deep/approve`, { gate, approved, modifications: modifications || '' })
+}
+
+/** 2d. 深度模式 AI 原型增强（独立端点，闸口外触发） */
+export async function deepPrototype(sessionId: string): Promise<{ html: string; sections: any[]; feature: string; spec: any }> {
+  return post(`/sessions/${sessionId}/deep/prototype`, {})
 }
 
 /** 3. 启动中等模式对话 */
@@ -182,10 +261,11 @@ export async function generateSection(
   section: string,
   callbacks: SectionCallbacks,
   signal?: AbortSignal,
+  ragEnabled: boolean = true,
 ): Promise<void> {
   await streamRequest(
     `/prd/sessions/${sessionId}/sections/${section}/generate`,
-    {},
+    { rag_enabled: ragEnabled },
     {
       onProgress: (data) => callbacks.onProgress?.(data as SectionEvent),
       onSectionComplete: (data) => callbacks.onSectionComplete?.(data as SectionCompleteEvent),
@@ -214,10 +294,11 @@ export async function regenerateSection(
   section: string,
   callbacks: SectionCallbacks,
   signal?: AbortSignal,
+  ragEnabled: boolean = true,
 ): Promise<void> {
   await streamRequest(
     `/prd/sessions/${sessionId}/sections/${section}/regenerate`,
-    {},
+    { rag_enabled: ragEnabled },
     {
       onProgress: (data) => callbacks.onProgress?.(data as SectionEvent),
       onSectionComplete: (data) => callbacks.onSectionComplete?.(data as SectionCompleteEvent),
@@ -252,6 +333,11 @@ export function exportPRD(sessionId: string): void {
   } catch { /* ignore */ }
   const qs = params.toString()
   window.open(`${API_BASE}/prd/sessions/${sessionId}/export${qs ? '?' + qs : ''}`, '_blank')
+}
+
+/** 11b. 导出 PRD 到飞书文档（返回飞书文档 URL） */
+export async function exportPRDToFeishu(sessionId: string): Promise<{ url: string; title: string }> {
+  return post(`/sessions/${sessionId}/export/feishu`, {})
 }
 
 /** 12. 文件上传 */

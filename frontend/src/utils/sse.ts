@@ -12,6 +12,9 @@ interface SSEHandlers {
   onSectionError?: (data: any) => void
   onComplete?: (data: any) => void
   onError?: (data: any) => void
+  onAgentComplete?: (data: any) => void
+  onGate?: (data: any) => void
+  onValidation?: (data: any) => void
 }
 
 const LLM_CONFIG_KEY = 'ai_center_llm_config'
@@ -105,6 +108,15 @@ export async function streamRequest(url: string, body: any, handlers: SSEHandler
               break
             case 'section_error':
               handlers.onSectionError?.(data)
+              break
+            case 'agent_complete':
+              handlers.onAgentComplete?.(data)
+              break
+            case 'gate':
+              handlers.onGate?.(data)
+              break
+            case 'validation':
+              handlers.onValidation?.(data)
               break
             case 'complete':
               handlers.onComplete?.(data)

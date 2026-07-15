@@ -847,6 +847,124 @@ Console 输出 `completedRef: Array(3)` 缺 active_rate。根因: 手写 SSE 解
 
 ---
 
+## 2026-07-13 · 功能变更分析模块持续优化 + 部署方案
+
+### 提取 prompt 强化 — user_visible 前置判断
+- **Per-group prompt 新增 `user_visible` 输出字段**：LLM 在提取时同时判断是否用户可见，不再需要独立的 `_filter_non_functional` 和 `_label_visibility` 阶段
+- **user_visible 判断标准细化**：明确 ✅必须保留 vs ❌必须过滤的反例
+  - true：用户可交互 UI、可感知业务逻辑、可触达交互行为
+  - false：埋点/追踪、API 代理/路由、枚举/常量/类型定义、重构/重命名、工具函数、测试类
+- **针对"属性/字段/逻辑/状态/键名"内部调整明确排除**：新增角色控制属性、修改服务列表展开逻辑、修改面板展开标识、新增配额评估器键名等一律 false
+- **核心原则**："属性、字段、逻辑、状态、键名等内部调整，只要不直接改变用户看到的界面或操作结果，一律 false"
+- 涉及文件：`backend/services/code_analyze_service.py`
+
+### 合并策略优化 — prompt 规则强化
+- **合并 prompt 新增 ✅必须合并 vs ❌禁止合并 的具体案例**：
+  - 必须合并：同一功能的不同部分（如实例对比 + 对比URL同步）、同一功能多入口
+  - 禁止合并：不同业务功能（如全局搜索 vs 实例对比）
+- **同类操作跨页面合并**：多个"新增XXX埋点"合并为一条
+- **拿不准时的处理**："不要合并，保留为独立条目"
+- **禁止"合并"二字出现在 description 中**
+- 涉及文件：`backend/services/code_analyze_service.py`
+
+### commit cache 移除 — 实时解析
+- **移除 `get_commit_cache` / `save_commit_cache`**：每次实时 `git rev-list --before` 解析，不缓存 commit hash
+- **commit_cache 表清空**：删除所有历史缓存记录
+- **目的**：确保所选时间段实时提取，不受缓存影响
+- 涉及文件：`backend/services/code_analyze_service.py`
+
+### 批量提取方案尝试与回退
+- **尝试批量提取**（85次→6次）：按目录模块分批，每批15个group，提取时同时合并
+- **问题**：描述出现"合并队列环境标签展示"（LLM把"合并"指令写进description）、条目反而增多
+- **回退**：恢复逐组提取（85次调用），保留 user_visible 字段和合并 prompt 优化
+- 涉及文件：`backend/services/code_analyze_service.py`
+
+### 部署方案 — 一键启动脚本（无 Docker）
+- **放弃 Docker 部署**：构建卡在 pip 下载 pandas，且对方装 Docker 麻烦
+- **新建 `start.sh`**（macOS/Linux）：自动检查环境、建venv、装依赖、build前端、复制飞书配置、装lark-cli、加载默认配置、启动
+- **新建 `start.bat`**（Windows）：同上 Windows 版
+- **新建 `部署说明.md`**：环境要求、一键启动、访问方式、内置配置、FAQ
+- **默认配置内置**：`backend/.env` 含 LLM API Key + Base URL + Model + Git Token，对方零配置直接用
+- **飞书配置内置**：`lark-config/` 含 lark-cli token 配置
+- **dist 内置**：frontend/dist + code-analyzer/dist 已 build，对方无需 build
+- 涉及文件：`start.sh`、`start.bat`、`部署说明.md`、`backend/.env`、`lark-config/`
+
+### 默认配置兜底机制
+- **`backend/run.py`**：启动时 `load_dotenv()` 加载 .env，注入 DEFAULT_* 环境变量
+- **`backend/app.py` `inject_llm_config`**：配置优先级 请求头 > DB > 环境变量默认值
+- **`backend/services/auth_middleware.py` `/api/auth/config GET`**：DB 空时返回 .env 默认配置，前端不弹设置框
+- **`backend/routers/code_analyze.py`**：git_token 请求体为空时兜底用 g.llm_config
+- **`backend/services/feishu_client.py`**：`_LARK_CONFIG_DIR` 从硬编码改为环境变量 `LARK_CONFIG_DIR`
+- **`backend/services/token_config.py`**：`_SKILL_SCRIPT` 支持环境变量 `AI_MEASURE_SCRIPT` 覆盖
+- 涉及文件：`backend/run.py`、`backend/app.py`、`backend/services/auth_middleware.py`、`backend/routers/code_analyze.py`、`backend/services/feishu_client.py`、`backend/services/token_config.py`
+
+### 打包
+- **`ai-app.tar.gz`**（1.1M）：源码 + dist + lark-config + .env + 启动脚本，排除 node_modules/venv/.git
+- 对方解压跑 `./start.sh` 即可，零配置上手
+
+---
+
+## 2026-07-14 ~ 2026-07-15 · 知识库接口对齐 + 问答历史 + 微服务配置共享
+
+### 知识库 API 对齐 T025 更新
+- **新增非流式查询接口**：`POST /api/chat/query`，代理到微服务 `/api/query`，返回 contexts（对齐文档 2.2，用于中控台自管 LLM）
+- **sync 接口改 3 模式**：`/sync` 从 dry_run/rebuild_core/rebuild_wiki 改为 `mode={backend|frontend|full}` + dry_run（仅 backend 生效）
+- **新增快照/回退 5 接口**：`POST /snapshots`、`GET /snapshots`、`GET /snapshots/{id}`、`POST /rollback`、`DELETE /snapshots/{id}`
+- **import 放开 collection**：`/import` 的 collection 从硬编码 manual_kb 改为请求体可指定，默认 manual_kb
+- 前端 `kbManage.ts` 新增 `SyncMode` 类型 + `SnapshotInfo`/`SnapshotDetail` 类型 + 5 个快照函数；`Chat.tsx` KbManage 页面 SYNC_MODES 改 3 模式 + dry-run 非 backend 禁用
+- 涉及文件：`backend/routers/chat.py`、`backend/routers/kb_manage.py`、`frontend/src/api/kbManage.ts`、`frontend/src/pages/KbManage.tsx`、`frontend/src/api/chat.ts`
+
+### 知识库问答历史功能（方案 C：中控台 SQLite 自管）
+- **新增 `chat_sessions` 表**：id/title/query/answer/sources/created_at + 索引
+- **CRUD 函数**：`save_chat_session`/`list_chat_sessions`/`get_chat_session`/`delete_chat_session`/`clear_chat_sessions`
+- **流式存历史**：`/send` 流式过程中累积 answer+sources，`[DONE]` 或流结束时存表
+- **历史 CRUD 接口**：`GET /conversations`（列表）、`GET /conversations/{id}`（详情）、`DELETE /conversations/{id}`（删单条）、`DELETE /conversations`（清空）
+- 前端 Chat.tsx 加左侧 260px 历史侧边栏：新对话/刷新/清空/单条删除/点击回看
+- 涉及文件：`backend/services/db.py`、`backend/routers/chat.py`、`frontend/src/api/chat.ts`、`frontend/src/pages/Chat.tsx`
+
+### 问答回答 Markdown 渲染
+- **问题**：回答含 `**任务管理**` 等 markdown bold 语法，纯文本展示显星号
+- **修复**：助手回答用 `ReactMarkdown` + `remark-gfm` 渲染，新建 `chat-markdown.css` 样式（标题/列表/代码块/表格/blockquote）
+- 涉及文件：`frontend/src/pages/Chat.tsx`、`frontend/src/chat-markdown.css`、`frontend/src/main.tsx`
+
+### 侧边栏可收起
+- **问题**：加历史侧边栏后页面空间不足
+- **修复**：AppLayout Sider 加 collapsible，展开 260px / 收起 80px（只显图标）
+- 展开态点品牌区 `MenuFoldOutlined` 收起，收起态点底部 `MenuUnfoldOutlined` 展开
+- 菜单 `inlineCollapsed` 自动适配图标模式，右侧内容区 marginLeft 平滑过渡
+- 涉及文件：`frontend/src/components/AppLayout.tsx`
+
+### 知识库问答历史 Bug 修复
+- **根因**：`save_chat_session` 用 `get_db()` → Flask `g.db`，流式 generator 在请求结束后才执行 save，请求上下文已销毁，`g` 失效抛 `Working outside of application context`，被 try 吞掉静默失败
+- **修复**：`save_chat_session` 改用 `_connect()` 直接建独立连接，不依赖 Flask `g`
+- **端到端验证**：微服务启动后问答一次，DB 记录数 1，answer 长度 1118 字符，历史正常存入
+- 涉及文件：`backend/services/db.py`
+
+### user_config 表 Migration
+- **问题**：旧 DB `user_config` 表缺 `git_token` 列，保存配置报 500（`CREATE TABLE IF NOT EXISTS` 不改已存在的表）
+- **修复**：`init_db` 加 migration 逻辑，检查列不存在则 `ALTER TABLE ADD COLUMN git_token`
+- 重启后自动迁移，旧 DB 升级
+- 涉及文件：`backend/services/db.py`
+
+### 微服务配置共享（阶段一）
+- **背景**：微服务（:8000）原硬编码 DeepSeek key + GL_TOKEN 散落 11 文件，后统一到 `.env` + `config.py` 读环境变量
+- **对接方式**：中控台 `backend/.env` 新增微服务同名环境变量：`DEEPSEEK_API_KEY`/`DEEPSEEK_BASE_URL`/`LLM_MODEL`/`GL_URL`/`GL_TOKEN`/`GL_PROJECT_ID`/`GL_SYNC_REF`
+- **新增 `start_microservice.sh`**：加载中控台 .env → export → 激活微服务 venv → 启动 agent_server.py
+- **路径全相对**：`SCRIPT_DIR` 动态获取，默认 `KB_SERVICE_DIR=$SCRIPT_DIR/../ju`（同级父目录），无绝对路径硬编码，迁移无碍
+- 微服务 `config.py` 自动读这些环境变量，无需改微服务代码
+- **端到端验证**：微服务启动日志显示 `DEEPSEEK_API_KEY: sk-f5f93...` + `GL_TOKEN: FpivCh...` 正确注入，问答流正常
+- 涉及文件：`backend/.env`、`start_microservice.sh`、`部署说明.md`
+- **阶段二（聚合启动）暂缓**：待对方机器有 Chroma/ollama 环境后，中控台 `start.sh` 一键启动微服务 + 中控台
+
+### Chat 页面精简
+- 删除"RAG 检索增强生成 · FastAPI 微服务"副标题
+- 删除"基于无矩 2.0 后端代码知识库..."副标题
+- 删除主页面 4 个推荐问题卡片（SUGGESTIONS）+ `handleSuggestionClick` 函数
+- 空状态改为简洁提示"在下方输入框输入问题，开始提问"
+- 涉及文件：`frontend/src/pages/Chat.tsx`
+
+---
+
 ## 2026-07-08 · PRD 模块状态总览
 
 ### 当前状态
@@ -898,3 +1016,113 @@ Console 输出 `completedRef: Array(3)` 缺 active_rate。根因: 手写 SSE 解
 - **Prompt 变更**：每个章节 Prompt 现在包含 `collected_info（三来源）+ 前序章节摘要 + 一致性约束`
 - 涉及文件：`backend/services/prd_gen_service.py`
 - 涉及文件：`frontend/src/pages/PrdGen.tsx`
+
+---
+
+## 2026-07-15~16 · PRD 深度模式完整实施
+
+### 背景
+基于 `docs/PRD深度模式实施方案v2.md`，中控台 PRD 生成系统从简单+中等模式扩展到深度模式（4 Agent 流水线 + 3 闸口 + 原型生成）。
+
+### 阶段 0：基建
+- kb_manage.py 加 5 个 graph 代理端点（modules/modules-detail/graph-impact/graph-flow/graph-node）
+- feishu_client.py 加 `markdown_to_docxml()` 工具
+- prd_gen_service.py 加 `_retrieve_reference_context()`（RAG 检索，降级空串）+ `export_to_feishu()` 飞书导出
+- PrdGen.tsx 加 ragEnabled 开关 + 飞书导出按钮 + "参考历史 PRD" 开关
+- 前端 api/prdGen.ts + api/kbManage.ts 加上对应 API 函数
+
+### 阶段 1：双模型路由 + Agent2
+- 新建 `model_router.py`：Agent2/3 强制 deepseek-v4-pro，Agent1/4 用 flash/用户配置
+- 新建 `_retrieve_platform_context(session)`：调图谱 5 端点组装「架构快照 + 影响范围」
+- 降级：微服务挂 → 空串，无匹配模块 → 提示自由设计
+
+### 阶段 2a：Agent1/2 + 状态机骨架
+- db migration：prd_sessions 加 deep_state/deep_artifacts/feishu_doc_url 列
+- 新建 `deep_agents.py`（Agent1 萃取 + Agent2 上下文分析）
+- deep_generate() SSE 状态机（Agent1→Agent2 串行）
+- /deep-generate 路由 + create_session 放开 deep 模式
+
+### 阶段 2b：Agent3/4 + 校验器 + 闸口 + 前端 UI
+- 新建 `validators.py`（6 校验器：Schema/Scope/Citation/Acceptance/Permission/Risk）
+- 新建 `deep_gates.py`（threading.Event 闸口挂起/恢复，30min 超时）
+- Agent3 功能规格（pro） + Agent4 PRD 撰写（flash, 输出 MD+spec_json）
+- 前端深度模式 UI：模式 Radio + 4 Agent Steps + Gate Modal + 结构化编辑
+- sse.ts 加 agent_complete / gate / validation 事件类型
+
+### 优化 1：Agent1 伪 Agentic
+- Agent1 改为双 pass：pass1 产出 questions_to_kb → 后端调 KB /api/query → pass2 融合
+- `_query_kb_agent()` 调微服务非流式查询，3 层 try/except 降级
+
+### 优化 2：闸口结构化编辑
+- conflict：逐条"采纳/忽略/自定义"单选按钮
+- impact：勾选保留 + 可编辑文字
+- spec：可编辑表格（名称/优先级下拉/移除）
+- 命名修正：去掉 flash/pro，改为"需求萃取/平台上下文分析/功能规格定义/PRD 撰写"
+
+### 优化 3：Agent5 原型生成
+- 新建 Agent5，直接输出完整 HTML（非 uiSpec 二次转换），使用 CDN antd
+- 注入 component_registry.json（606 组件，21 project + 20 业务 Top）
+- 原型生成改为独立端点 `POST /deep/prototype`，闸口外手动触发
+- 原型区域放在 PRD 下方（iframe 预览 + 在新窗口打开 + 下载 HTML）
+
+### 体验修复
+- Agent1 审核闸口（always show，展示 requirements/conflicts/gaps，可修改后继续）
+- 原型改为手动触发，不在 Agent4 完成后自动弹窗
+- PRD 渲染修复（white-space: pre-wrap + \n 转义兼容）
+- Steps 深度步骤统一引用 DEEP_STEPS（5 步含原型生成）
+- 修正内容传递给后续 Agent（user_fixes 注入上下文）
+
+### 历史 PRD 管理（API_PRD.md 对接）
+- kb_manage.py 加 7 个代理端点（PRD CRUD + 搜索 + design-layouts + component-registry）
+- KbManage.tsx 加"历史 PRD"Tab（搜索/状态筛选/分页/查看 Markdown 全文/删除/文件导入）
+- 导入支持拖拽 .md/.txt 文件自动填入内容
+
+### LLM 超时修复
+- LLMClient 加 timeout=300s 默认超时
+- 各 Agent 独立超时（Agent1/4=90s, Agent2=180s, Agent3=240s, Agent5=180s）
+- timeout 仅在非 None 时传入 kwargs，避免覆盖客户端默认
+
+### 关键教训
+1. `kwargs = dict(timeout=None)` 覆盖客户端默认 → 需 `if timeout is not None`
+2. Prompt 模板花括号转义错误 → ValueError: Single '}' → 测试 format 稳定
+3. Agent5 直接输出 HTML 比 uiSpec→二次转换好得多
+4. SSE agent_complete 事件中 prd_markdown 不要截断
+5. 闸口修改需 `user_fixes` 列表透传给后续 Agent
+
+### 涉及文件
+- 新建：`backend/services/deep_agents.py`, `validators.py`, `deep_gates.py`, `model_router.py`
+- 新建：`frontend/src/components/RenderEngine.tsx`（已移除，Agent5 直接输出 HTML）
+- 修改：`backend/services/prd_gen_service.py`, `llm_client.py`, `feishu_client.py`, `db.py`
+- 修改：`backend/routers/prd_gen.py`, `kb_manage.py`
+- 修改：`frontend/src/pages/PrdGen.tsx`, `KbManage.tsx`
+- 修改：`frontend/src/api/prdGen.ts`, `kbManage.ts`
+- 修改：`frontend/src/utils/sse.ts`
+
+---
+
+## 2026-07-16 18:00-20:00 · 深度模式修复（git revert 后重建）
+
+### 背景
+git checkout 恢复了 `PrdGen.tsx` 到提交版本，导致所有深度模式前端改动丢失（约 500 行）。
+KbManage.tsx、API 文件、后端文件不受影响。
+
+### 重建内容
+- **handleDeepGenerate + handleApproveGate + updateGateItem**：深度模式 SSE 流式处理 + 闸口审批
+- **renderDeepSection**：Agent 卡片 + Steps + PRD 预览/编辑/diff/版本 + 原型生成
+- **renderAgentCard**：Agent 产出折叠展示
+- **Gate Modal with editing**：conflict(采纳/忽略/编辑)、impact(勾选+编辑)、spec(可编辑表格)
+- **DEEP_STEPS + deepStepCurrent**：深度模式 5 步流水线
+- **Steps 位置整理**：简单/中等在输入栏底部、深度在 DeepSection 顶部
+- **handleDeepGenerate 分支**：`handleStart` 修复缺少 `mode === 'deep'` 判断
+- **原型生成按钮 + iframe + 下载**
+- **handleExportFeishu + handleViewProto + handleDownloadProto**
+
+### 关键教训
+1. **git checkout <file> 会丢失所有未提交改动**，文件有备份策略或更频繁提交
+2. **Python 脚本修改 JSX 文件极不可靠**：花括号/引号/尖括号易引入语法错误，重建脚本需测试
+3. **前端函数定义和 JSX 引用必须在同一作用域**：handleApproveGate/updateGateItem 等要在 return 之前定义
+4. **Steps 位置按用户需求调整多次**：页面顶部 → 输入栏底部 → 深度区顶部，每次都要改 render 结构
+
+### 涉及文件
+- 修改：`frontend/src/pages/PrdGen.tsx`（git revert 后重建）
+- 修改：`docs/PRD深度模式实施方案v2.md`

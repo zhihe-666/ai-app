@@ -15,7 +15,7 @@ from pathlib import Path
 sys.stdout.reconfigure(line_buffering=True)
 
 from services.llm_client import LLMClient
-from services.db import get_commit_cache, save_commit_cache
+from services.db import save_commit_cache as _unused_save_cache  # noqa: F401 (kept for compat)
 
 GIT_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'data/git-cache')
 SNAPSHOT_FILE = "knowledge_snapshot.json"
@@ -222,12 +222,7 @@ class CodeAnalyzeService:
                     raise RuntimeError(f"git re-clone failed: {result.stderr}")
 
     def _resolve_commits(self, branch: str, start_time: str, end_time: str):
-        # Check cache first — same repo + branch + time range = same commits
-        cached = get_commit_cache(self.repo_url, branch, start_time, end_time)
-        if cached:
-            print(f"[CodeAnalyze] Using cached commits: {cached['base_commit'][:8]}..{cached['target_commit'][:8]}")
-            return cached['base_commit'], cached['target_commit']
-
+        # 每次实时解析 commit，不使用缓存，确保所选时间段实时提取
         base = subprocess.run(
             ["git", "rev-list", "-n", "1", "--before", start_time,
              f"refs/heads/{branch}"],
@@ -245,8 +240,7 @@ class CodeAnalyzeService:
         if base == target:
             raise ValueError("Base 和 Target 相同，时间段内无变更")
 
-        # Persist cache for future runs
-        save_commit_cache(self.repo_url, branch, start_time, end_time, base, target)
+        # 不缓存 commit，每次实时解析
         return base, target
 
     def _collect_commit_messages(self, base: str, target: str,
@@ -481,8 +475,18 @@ class CodeAnalyzeService:
 - **重构/重命名**：提取公共方法、重命名变量/函数、调整代码结构、拆分组件
 - **工具函数**：纯数据转换逻辑、工具函数优化、数据映射调整
 - **测试类**：新增测试用例、修改测试数据
+- **属性/字段调整**：新增角色控制属性、修改字段属性、调整数据字段、新增配置属性字段——这些只是数据结构层面的字段增减，用户看不到字段本身
+- **内部逻辑调整**：修改服务列表展开逻辑、调整匹配逻辑、修改去重逻辑、调整状态判断逻辑——这些是代码内部处理流程的调整，除非直接改变用户看到的界面或操作结果，否则为 false
+- **内部状态管理**：修改面板展开标识、调整状态键值、改用内部 ID 作为标识——纯内部状态管理，用户无感知
 
-**核心判断：** 问自己"这个变更，用户在使用产品时能直接看到或感受到吗？"能 → true，不能 → false。
+**关键反例（必须 user_visible=false）：**
+- "新增角色控制属性" → false（只是新增了一个控制字段，用户看不到字段）
+- "修改服务列表展开逻辑" → false（内部展开状态管理，不改变用户能看到的界面内容）
+- "新增配额评估器键名" → false（内部键名定义，用户无感知）
+- "调整操作状态枚举值顺序" → false（枚举值重排，用户无感知）
+- "修改面板展开标识" → false（内部状态键调整）
+
+**核心判断：** 问自己"这个变更，用户在使用产品时能直接看到或感受到吗？"能 → true，不能 → false。**属性、字段、逻辑、状态、键名等内部调整，只要不直接改变用户看到的界面或操作结果，一律 false。**
 
 **描述规则：**
 1. 只描述业务功能，**不要包含文件路径、文件名、目录结构**
@@ -903,14 +907,31 @@ class CodeAnalyzeService:
   ]
 }}
 
-规则：
-- 将描述同一功能模块、description相近或有重合的条目合并为一条，重点关注名称相近的条目
-- **同类操作跨页面合并**：如果多个条目描述的是同类操作（如"新增埋点"、"新增埋点事件"、"新增XXX埋点"），即使它们在不同页面，也合并为一条，如"新增多处操作埋点"
-- 综合考虑 description 和名称判断，既不能漏掉相似条目，也不能误合并不同条目
-- 多个描述同一功能的条目合并为一条，一个条目最多只能参与合并一次，避免合并后出现两个条目中存在重复的描述
-- 合并后的 description 整合多条的核心信息，50-150 字，用自然语言表达
-- 合并后的名称重新提炼，15 字以内，动词开头
-- 合并后如果还有多个不同的条目，就输出多个"""
+**合并判断规则（按严格程度排序）：**
+
+✅ 必须合并 — 描述的是**同一个功能的不同部分/同一功能在多个文件**：
+- 条目 A "新增实例对比功能" + 条目 B "新增实例对比URL同步" → 合并（同一功能的不同实现部分）
+- 条目 A "新增跨任务对比分享" + 条目 B "新增版本历史分享链接" → 合并（同一分享功能的不同入口）
+
+✅ 必须合并 — 同类操作的多个实例（散落在不同页面）：
+- 多个"新增XXX埋点"条目（如评估埋点、回滚埋点、同步埋点）→ 合并为"新增多处操作埋点"
+- 多个"新增XXX字段"条目（针对同一功能的不同字段）→ 合并
+
+❌ 禁止合并 — 描述的是**不同业务功能**：
+- "新增全局搜索" vs "新增实例对比" → 不合并（不同功能）
+- "新增部署倒计时" vs "新增审批流程" → 不合并（不同功能）
+- "新增PS服务类型" vs "新增队列环境" → 不合并（不同功能）
+
+**关键判断原则：**
+1. 看条目是否指向**同一业务能力**：是 → 合并；否 → 不合并
+2. 同一功能的多个实现部分（如同一功能在不同文件/不同入口）→ 合并
+3. 不同功能即使涉及相似代码模式（如都是埋点、都是新增字段）→ 只有当它们是同一功能的组成部分时才合并
+4. 拿不准是否同一功能时 → **不要合并**，保留为独立条目
+
+**合并后要求：**
+- description 整合多条的核心信息，50-150 字，自然语言表达，**不要出现"合并"二字**
+- name 重新提炼，15 字以内，动词开头
+- 一个条目最多只能参与合并一次"""
         try:
             resp = client.chat(system=prompt, user="", temperature=0.0, max_tokens=8192, seed=42)
             print(f"[CodeAnalyze] 合并响应前200字: {resp[:200]}")

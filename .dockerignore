@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+*.egg
+
+# Node
+node_modules/
+frontend/dist/
+# Note: tools/code-analyzer/dist IS needed, handled in Dockerfile build stage
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Data & cache (mounted as volumes, not baked in)
+data/
+backend/data/
+backend/data/git-cache/
+
+# Secrets & config (backend/.env 除外，需打进镜像作为默认配置)
+.env
+.env.local
+*.token
+**/config.yaml
+!backend/.env
+
+# Logs
+*.log
+logs/
+/tmp/
+
+# Debug
+api_response_debug.json
+extract_pv.py
+inspect_files.py
+test_drilldown.py
+
+# Design docs
+前端代码变更分析模块-完整实现方案.md
+用户pv统计.xlsx
+
+# Claude / harness config
+.dclaw/
+.dewuclaw/
+.claude/
+memory/
+skills/
+
+# Git
+.git/
+.gitignore
+
+# Docs (optional, keeps image small)
+docs/
+*.md
+!backend/README.md
+!frontend/README.md

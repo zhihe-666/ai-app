@@ -1287,3 +1287,151 @@ def _build_preceding_sections_text(session, current_section):
 3. **Flask 3.1 没有 `request.is_disconnected()`**：Generator 断开时 `BrokenPipeError` 自然触发，`finally` 块清理资源
 4. **前端路径选择影响分析范围**：默认只选 `ml-data` 导致 `ml-main` 的变更完全遗漏，这是配置问题不是代码问题
 5. **证据文件匹配不适合跨目录合并**：不同页面的相同操作（如埋点）不共用文件，需要全局语义合并
+
+---
+
+## 8. 功能变更分析模块持续优化 + 一键部署（2026-07-13）
+
+### 背景
+
+07-10 优化后，功能变更分析模块仍有问题：
+1. **非功能变更未过滤干净**：报告里还出现"新增角色控制属性"、"修改服务列表展开逻辑"、"新增配额评估器键名"这类内部调整项
+2. **过滤和打标分两个阶段**：`_filter_non_functional` 和 `_label_visibility` 各一次 LLM 调用，冗余
+3. **Token 消耗大**：85 次逐组提取 + 过滤 + 合并，~200k tokens
+4. **部署困难**：对方要装 Python/Node/依赖/lark-cli，门槛高
+5. **跨内网访问不了**：对方能 ping 通但 HTTP 访问失败
+
+### 优化过程
+
+**Phase 1：user_visible 前置到提取阶段**
+- 原流程：per-group 提取（85次）→ 分类 → `_filter_non_functional`（分批）→ 合并 → `_label_visibility`（整批）→ 输出
+- 新流程：per-group 提取时同步输出 `user_visible`，不合格的直接丢弃，不再需要 `_filter_non_functional` 和 `_label_visibility`
+- 节省 2 次 LLM 调用 + 后续合并输入量减小
+
+**Phase 2：user_visible 判断标准细化**
+- 针对"属性/字段/逻辑/状态/键名"这类内部调整明确排除
+- 新增反例：新增角色控制属性、修改服务列表展开逻辑、修改面板展开标识、新增配额评估器键名
+- 核心原则："属性、字段、逻辑、状态、键名等内部调整，只要不直接改变用户看到的界面或操作结果，一律 false"
+
+**Phase 3：合并 prompt 规则强化**
+- 新增 ✅必须合并 vs ❌禁止合并 的具体案例
+- 拿不准时不要合并，保留独立条目
+- 禁止"合并"二字出现在 description 中（之前 LLM 把"合并"指令写进了描述）
+
+**Phase 4：commit cache 移除**
+- 用户反馈"提取太快可能用了缓存"
+- 移除 `get_commit_cache` / `save_commit_cache`，每次实时 `git rev-list --before` 解析
+- 确保所选时间段实时提取（虽然 cache 只存 hash 不影响正确性，但满足"实时"诉求）
+
+**Phase 5：批量提取方案尝试与回退**
+- 尝试把 85 次逐组提取改成 6 次批量提取（每批 15 个 group，提取时同时合并）
+- 问题：LLM 把"合并"指令写进 description、条目反而增多（LLM 在批量场景倾向"保险起见每 group 单独输出"）
+- 回退：恢复逐组提取，保留 user_visible 前置和合并 prompt 优化
+
+**Phase 6：默认配置兜底**
+- 对方访问前端被强制要求配置 LLM/Git Token，无法保存
+- `backend/.env` 内置默认配置（DeepSeek API + Git Token）
+- `run.py` 启动时 `load_dotenv()` 加载
+- `app.py` `inject_llm_config` 配置优先级：请求头 > DB > 环境变量默认值
+- `/api/auth/config GET` DB 空时返回 .env 默认配置，前端不弹设置框
+
+**Phase 7：一键部署方案**
+- 放弃 Docker（构建卡在 pip 下载，对方装 Docker 麻烦）
+- 新建 `start.sh`（macOS/Linux）/ `start.bat`（Windows）：自动检查环境、建venv、装依赖、build前端、复制飞书配置、装lark-cli、加载默认配置、启动
+- 默认配置内置（.env + lark-config），对方零配置直接用
+- dist 内置（frontend/dist + code-analyzer/dist），对方无需 build
+- 打包 `ai-app.tar.gz`（1.1M），对方解压跑 `./start.sh` 即可
+
+### 关键教训
+
+1. **user_visible 判断要前置**：在提取阶段结合 diff 上下文判断，比事后看 description 更准，还能省 LLM 调用
+2. **prompt 反例要具体**：光说"不要非功能变更"不够，要给出具体反例（新增角色控制属性、修改服务列表展开逻辑等），LLM 才能准确过滤
+3. **批量提取 + 同时合并行不通**：LLM 在一个 prompt 里既要提取又要合并，两者互相干扰，描述里会出现"合并"指令字样。提取和合并必须分阶段
+4. **commit cache 用户的认知偏差**：cache 只存 hash 不影响正确性，但"秒过"会让用户怀疑用了缓存。实时解析虽慢一点但消除疑虑
+5. **部署门槛要降到最低**：对方零配置直接用（内置 .env + lark-config + dist），一键启动脚本自动装依赖，比 Docker 更轻量
+6. **跨内网 HTTP 访问限制**：公司网络可能只放行 80/443，ping 通不代表 HTTP 通。socat 转发 80 是临时方案，长期需正式部署或内网穿透
+7. **硬编码路径是部署杀手**：`_LARK_CONFIG_DIR`、`_SKILL_SCRIPT` 硬编码 `/Users/admin/...`，对方机器不存在就崩。必须改成环境变量 + 默认值
+
+---
+
+## 9. 知识库对接 + 问答历史 + 微服务配置共享（2026-07-14 ~ 07-15）
+
+### 背景
+
+知识库微服务发布 T025 更新（sync 3 模式 + 快照回退 + code_frontend collection），中控台需对齐。同时问答功能缺历史记录，回答显示 markdown 星号，页面空间不足。
+
+### 优化过程
+
+**Phase 1：API 对齐 T025**
+- 新增非流式 `/api/chat/query` 接口（对齐文档 2.2）
+- sync 接口从 dry_run/rebuild_core/rebuild_wiki 改 3 模式（backend/frontend/full）
+- 新增快照/回退 5 个接口
+- 前端 KbManage 页面 SYNC_MODES 重构，dry-run 仅 backend 支持
+
+**Phase 2：问答历史（方案 C 中控台自管）**
+- 加 `chat_sessions` 表 + CRUD 函数 + 4 个 REST 接口
+- 流式 `/send` 累积 answer+sources，`[DONE]` 时存表
+- 前端 Chat.tsx 加左侧 260px 历史侧边栏
+
+**Phase 3：Markdown 渲染**
+- 回答用 ReactMarkdown + remark-gfm 渲染
+- 新建 chat-markdown.css 样式
+- `**任务管理**` 显示加粗不再显星号
+
+**Phase 4：侧边栏可收起**
+- AppLayout Sider 加 collapsible（260↔80px）
+- 收起后页面多出 180px 空间
+
+**Phase 5：问答历史 Bug 修复（关键）**
+- 根因：`save_chat_session` 用 Flask `g.db`，流式 generator 在请求结束后执行 save，请求上下文已销毁，`g` 失效抛 `Working outside of application context`，被 try 吞掉静默失败
+- 修复：改用 `_connect()` 直接建独立连接
+- 端到端验证：DB 记录数 1，answer 1118 字符，正常存入
+
+**Phase 6：user_config Migration**
+- 旧 DB 缺 git_token 列，保存配置 500
+- init_db 加 ALTER TABLE migration，旧 DB 自动升级
+
+**Phase 7：微服务配置共享（阶段一）**
+- 微服务原硬编码 DeepSeek key + GL_TOKEN 散落 11 文件，后统一到 `.env` + config.py 读环境变量
+- 中控台 `backend/.env` 加微服务同名环境变量
+- 新建 `start_microservice.sh`：加载中控台 .env → export → 启动微服务
+- 路径全相对（SCRIPT_DIR + ../ju），迁移无碍
+- 端到端验证：微服务日志显示配置正确注入，问答流正常
+
+### 关键教训
+
+1. **Flask `g` 对象在流式 generator 中不可靠**：流式响应的 generator 在请求结束后才执行后续逻辑（如存历史），此时请求上下文已销毁，`g.db` 失效。流式场景的 DB 操作必须用独立连接 `_connect()`，不能依赖 `get_db()`
+2. **静默失败最坑**：`try/except` 吞掉异常，表建了、接口正常、调用点有，但 save 执行时上下文失效，日志里才有 `Working outside of application context`。流式 DB 操作要查日志验证
+3. **`CREATE TABLE IF NOT EXISTS` 不改已存在的表**：旧 DB schema 变了（加列）需要 migration，`ALTER TABLE ADD COLUMN` + 列存在检查。不能假设表是最新 schema
+4. **微服务配置共享靠环境变量同名**：微服务读 `DEEPSEEK_API_KEY` 等环境变量，中控台 .env 加同名变量，启动脚本 export 注入。两边零侵入共享，改一处生效。不能靠请求 header 传（微服务单例 client 启动时读，不读请求）
+5. **Markdown 回答要前端渲染**：LLM 输出含 `**bold**` 等语法，纯文本展示显星号。react-markdown + remark-gfm 渲染 + 自定义 CSS 是正解
+6. **部署路径必须全相对**：`SCRIPT_DIR` 动态获取 + `../ju` 同级目录，避免 `/Users/admin` 硬编码。迁移到任何机器路径都能适应
+7. **侧边栏可收起提升空间利用率**：加历史侧边栏后挤占对话区，Sider collapsible 一键收起只显图标，展开/收起平滑过渡
+
+---
+
+## 第 10 章：PRD 深度模式 + Agent 编排 + 原型生成（2026-07-15~16）
+
+### 7 个 Phase
+
+1. **知识库侧基建**（ju 项目）：影响范围算法 A1 + 模块索引 A2 + 5 对外 API A3 + 后端调用链 Linker A4 + 组件提取器 B1 + 组件图谱 B2 + registry B3。全 ✅
+2. **中控台基建**（阶段 0）：kb_manage graph 代理 5 端点 + RAG 检索注入(降级空串) + 飞书导出
+3. **Agent 核心**（阶段 1-2）：双模型路由(pro/flash) + 4 Agent 流水线 + 6 校验器 + 3 人工闸口
+4. **原型生成**（阶段 3）：Agent5 直接输出 HTML，注入组件注册表(606 组件)保持平台风格
+5. **5 轮优化**：伪 Agentic KB 查询 + 闸口结构化编辑 + Agent 命名 + 代理间修正传递 + PRD 渲染修复
+6. **历史 PRD 管理**：对接 API_PRD.md 7 端点，KbManage 加 CRUD Tab
+7. **LLM 超时修复**：kwargs timeout=None 覆写客户端默认的 Bug
+
+### 关键教训
+
+1. **`kwargs = dict(timeout=None)` 会覆写客户端默认值**：OpenAI `client(timeout=300)` + `create(timeout=None)` = 无超时。需 `if timeout is not None: kwargs['timeout'] = timeout`
+2. **Prompt 模板花括号要仔细**:`{{"key":"value"}}` 中每一层花括号都要双倍，漏一个 `}` 就 ValueError。写完后 `prompt.format(...)` 自测
+3. **Agent5 直接输出 HTML 远优于 uiSpec→二次转换**: uiSpec JSON 是中间表示，前端再转 HTML 丢失大量细节。LLM 直接输出完整 HTML + CDN antd，质量可交付
+4. **闸口修改不传后续 Agent = 形同虚设**:用户改了 Gate1, Agent2/3/4 看不到。需 `user_fixes` 列表显式注入上下文
+5. **SSE 事件数据不要截断**:`prd_markdown[:200]` 导致前端 PRD 只显示开头几句。完整 4806 字符直接发
+6. **Steps 硬编码 vs 引用**:renderDeepSection 内 `deepStepNames` 硬编码 4 步，外层 `DEEP_STEPS` 已更新为 5 步。两端不一致导致 Steps 缺少原型生成
+7. **Agent 编排用状态机够用**:4 Agent 线性 + 3 闸口，Flask SSE generator + threading.Event 足够。LangGraph 的 checkpoint/resume 在此场景收益小，迁移成本低
+8. **历史 PRD 管理应归入知识库管理**:不要另起模块，KbManage 加 Tab 复用现有导航和布局
+9. **git checkout <file> 会丢失未提交改动**：恢复单文件时确认所有改动已提交或 stash。深度模式前端 ~500 行因 git revert 丢失，需手动重建
+10. **Python 脚本改 JSX 风险高**：花括号/引号/尖括号转义繁琐，多次引入语法错误。JSX 修改优先用 Edit 工具或手动编辑，Python 脚本仅用于简单字符串替换
+11. **Agent5 原型质量瓶颈在 LLM 遵守指令能力**：prompt 注入 design_layouts + component_registry 但 LLM 不一定遵守。改进方向：布局模板化（LLM 只填数据不决定结构）+ 模块匹配用 LLM 分类替代关键词

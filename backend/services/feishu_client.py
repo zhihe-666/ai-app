@@ -18,7 +18,11 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # lark-cli bot 配置目录（确保子进程继承正确身份）
-_LARK_CONFIG_DIR = "/Users/admin/.dewuclaw/lark-cli-config/cli_aa847daba1bc1bb3"
+# 支持环境变量覆盖，默认 ~/.dewuclaw/lark-cli-config/cli_aa847daba1bc1bb3
+_LARK_CONFIG_DIR = os.environ.get(
+    "LARK_CONFIG_DIR",
+    os.path.expanduser("~/.dewuclaw/lark-cli-config/cli_aa847daba1bc1bb3")
+)
 
 
 class LarkCliError(Exception):
@@ -220,6 +224,99 @@ def search_minutes(keyword: str, start_time: str = "",
 
 
 # ── 文档创建 ──
+
+
+def markdown_to_docxml(markdown: str, title: str) -> str:
+    """将 Markdown 转为飞书 DocxXML（create_doc_xml 的 content_xml 入参）
+
+    支持：标题(#/##/###)、列表(-/*)、引用(>)、加粗(**text**)、表格(| a | b |)、代码块(```...```)。
+    不支持的语法按段落原样输出。
+    """
+    import re
+
+    parts: list[str] = [f'<title>{title}</title>']
+    lines = markdown.split('\n')
+    i = 0
+    n = len(lines)
+    in_code = False
+    code_buf: list[str] = []
+
+    def _inline_bold(text: str) -> str:
+        return re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
+
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+
+        # 代码块边界
+        if stripped.startswith('```'):
+            if in_code:
+                parts.append(f'<p><code style="background-color:#f5f5f5">{_escape_xml(chr(10).join(code_buf))}</code></p>')
+                code_buf = []
+                in_code = False
+            else:
+                in_code = True
+            i += 1
+            continue
+        if in_code:
+            code_buf.append(line)
+            i += 1
+            continue
+
+        if not stripped:
+            i += 1
+            continue
+
+        # 表格（| ... | 行连续，遇分隔行 |---| 跳过）
+        if stripped.startswith('|') and '|' in stripped[1:]:
+            table_rows: list[list[str]] = []
+            while i < n and lines[i].strip().startswith('|'):
+                row = lines[i].strip()
+                if not re.match(r'^\|[\s:-]+\|$', row):  # 跳过分隔行 |---|
+                    cells = [c.strip() for c in row.strip('|').split('|')]
+                    table_rows.append(cells)
+                i += 1
+            if table_rows:
+                header = table_rows[0]
+                body = table_rows[1:]
+                tbl = ['<table>']
+                tbl.append('<tr>' + ''.join(f'<th><b>{_escape_xml(c)}</b></th>' for c in header) + '</tr>')
+                for r in body:
+                    tbl.append('<tr>' + ''.join(f'<td>{_escape_xml(c)}</td>' for c in r) + '</tr>')
+                tbl.append('</table>')
+                parts.append(''.join(tbl))
+            continue
+
+        if stripped.startswith('# ') or stripped.startswith('## '):
+            text = stripped.lstrip('#').strip()
+            parts.append(f'<p><b>{_escape_xml(text)}</b></p>')
+        elif stripped.startswith('### '):
+            text = stripped[4:].strip()
+            parts.append(f'<p><b>{_escape_xml(text)}</b></p>')
+        elif stripped.startswith('- ') or stripped.startswith('* '):
+            text = stripped[2:].strip()
+            parts.append(f'<p>• {_inline_bold(_escape_xml(text))}</p>')
+        elif stripped.startswith('> '):
+            text = stripped[2:].strip()
+            parts.append(f'<p><i>{_escape_xml(text)}</i></p>')
+        else:
+            parts.append(f'<p>{_inline_bold(_escape_xml(stripped))}</p>')
+        i += 1
+
+    # 收尾未闭合代码块
+    if in_code and code_buf:
+        parts.append(f'<p><code style="background-color:#f5f5f5">{_escape_xml(chr(10).join(code_buf))}</code></p>')
+
+    return '\n'.join(parts)
+
+
+def _escape_xml(text: str) -> str:
+    """转义 XML 特殊字符"""
+    return (
+        text.replace('&', '&amp;')
+        .replace('<', '&lt;')
+        .replace('>', '&gt;')
+    )
 
 
 def create_doc_xml(title: str, content_xml: str) -> str:

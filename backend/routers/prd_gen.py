@@ -50,8 +50,8 @@ def create_session():
     mode = data.get('mode', 'simple')
     user_input = data.get('userInput', '')
 
-    if mode not in ('simple', 'medium'):
-        return {'error': '无效的模式，仅支持 simple / medium'}, 400
+    if mode not in ('simple', 'medium', 'deep'):
+        return {'error': '无效的模式，仅支持 simple / medium / deep'}, 400
 
     session = service.create_session(mode, user_input)
     if not session:
@@ -73,10 +73,117 @@ def simple_generate(id):
     if not cfg['api_key']:
         return _sse_error('请先配置 LLM API Key')
 
+    data = request.get_json(silent=True) or {}
+    rag_enabled = data.get('rag_enabled', True)
+
     def generate():
-        yield from service.simple_generate(id, cfg['api_key'], cfg['base_url'], cfg['model'])
+        yield from service.simple_generate(id, cfg['api_key'], cfg['base_url'], cfg['model'], rag_enabled)
 
     return sse_stream(generate)
+
+
+# ── 2c. 深度模式 SSE 生成（2a：Agent1→Agent2 串行）──
+
+
+@prd_gen_bp.route('/sessions/<id>/deep-generate', methods=['POST'])
+def deep_generate(id):
+    """深度模式 SSE 流式编排
+
+    2a 阶段：Agent1（需求萃取）→ Agent2（上下文分析）。
+    Agent3/4 + 人工闸口留 2b。
+    """
+    cfg = _get_llm_config()
+    if not cfg['api_key']:
+        return _sse_error('请先配置 LLM API Key')
+
+    data = request.get_json(silent=True) or {}
+    rag_enabled = data.get('rag_enabled', True)
+
+    def generate():
+        yield from service.deep_generate(id, cfg['api_key'], cfg['base_url'], cfg['model'], rag_enabled)
+
+    return sse_stream(generate)
+
+
+# ── 2d. 深度模式人工闸口审批 ──
+
+
+@prd_gen_bp.route('/sessions/<id>/deep/approve', methods=['POST'])
+def deep_approve(id):
+    """深度模式人工闸口审批
+
+    唤醒 SSE generator 中挂起的 gate（conflict/impact/spec）。
+
+    请求体：
+        gate (str): 闸口名 conflict|impact|spec
+        approved (bool): 是否通过
+        modifications (str): 用户补充修改（可选，注入 artifacts）
+    """
+    from services.deep_gates import approve_gate
+
+    data = request.get_json(silent=True) or {}
+    gate_name = data.get('gate', '')
+    approved = data.get('approved', True)
+    modifications = data.get('modifications', '')
+
+    if not gate_name:
+        return {'error': '缺少 gate 参数'}, 400
+
+    ok = approve_gate(id, gate_name, approved, modifications)
+    if not ok:
+        return {'error': f'闸口 {gate_name} 不存在或未在等待'}, 404
+    return {'ok': True, 'gate': gate_name, 'approved': approved}
+
+
+# ── 2e. 深度模式 AI 原型增强（独立端点，非闸口内）──
+
+
+@prd_gen_bp.route('/sessions/<id>/deep/prototype', methods=['POST'])
+def deep_prototype(id):
+    """基于已完成的 PRD + spec，运行 Agent5 生成产品原型
+
+    Agent5 输出结构化数据 → prototype_renderer 渲染为可靠 HTML（纯 CSS，无 JS 依赖）。
+    空 section 自动重试一次。
+    返回 JSON: {html, sections, feature, spec}
+    """
+    from services.deep_agents import agent5_prototype
+    from services.prd_gen_service import PRDGenService
+
+    svc = PRDGenService()
+    session = svc.get_session(id)
+    if not session:
+        return {'error': '会话不存在'}, 404
+
+    import json
+    artifacts = json.loads(session.get('deep_artifacts', '{}') or '{}')
+    if not artifacts.get('agent4'):
+        return {'error': 'PRD 尚未完成，请先完成深度模式生成流程'}, 400
+
+    cfg = _get_llm_config()
+    if not cfg['api_key']:
+        return {'error': '请先配置 LLM API Key'}, 400
+
+    sections = []
+    agent5_out = {}
+    for attempt in range(2):
+        try:
+            agent5_out = agent5_prototype(session, artifacts, cfg['api_key'], cfg['base_url'], cfg['model'])
+            sections = agent5_out.get('sections', []) or []
+            if sections:
+                break
+            logger.warning(f'[PRDGen] Agent5 第 {attempt+1} 次产出为空，重试…')
+        except Exception as e:
+            logger.warning(f'[PRDGen] Agent5 第 {attempt+1} 次失败: {e}')
+            if attempt == 1:
+                return {'error': f'原型生成失败: {str(e)}'}, 500
+
+    html = agent5_out.get('html', '')
+    return {
+        'html': html,
+        'sections': sections,
+        'feature': artifacts.get('agent4', {}).get('spec', {}).get('feature', 'PRD 原型'),
+        'spec': artifacts.get('agent4', {}).get('spec', {}),
+    }
 
 
 # ── 3. 中等模式对话 ──
@@ -179,8 +286,11 @@ def generate_section(id, section):
     if not cfg['api_key']:
         return _sse_error('请先配置 LLM API Key')
 
+    data = request.get_json(silent=True) or {}
+    rag_enabled = data.get('rag_enabled', True)
+
     def generate():
-        yield from service.generate_section(id, section, cfg['api_key'], cfg['base_url'], cfg['model'])
+        yield from service.generate_section(id, section, cfg['api_key'], cfg['base_url'], cfg['model'], rag_enabled)
 
     return sse_stream(generate)
 
@@ -211,8 +321,11 @@ def regenerate_section(id, section):
     if not cfg['api_key']:
         return _sse_error('请先配置 LLM API Key')
 
+    data = request.get_json(silent=True) or {}
+    rag_enabled = data.get('rag_enabled', True)
+
     def generate():
-        yield from service.regenerate_section(id, section, cfg['api_key'], cfg['base_url'], cfg['model'])
+        yield from service.regenerate_section(id, section, cfg['api_key'], cfg['base_url'], cfg['model'], rag_enabled)
 
     return sse_stream(generate)
 
@@ -264,6 +377,25 @@ def export_prd(id):
         mimetype='text/markdown',
         headers={'Content-Disposition': f'attachment; filename="PRD-{safe_name}.md"'},
     )
+
+
+# ── 11b. 导出 PRD 到飞书文档 ──
+
+
+@prd_gen_bp.route('/sessions/<id>/export/feishu', methods=['POST'])
+def export_prd_to_feishu(id):
+    """将生成的 PRD 写入飞书文档（DocxXML 格式）
+
+    成功返回飞书文档 URL，失败返回 error 信息。
+    """
+    session = service.get_session(id)
+    if not session:
+        return {'error': '会话不存在'}, 404
+
+    result = service.export_to_feishu(id)
+    if 'error' in result:
+        return result, 400
+    return result
 
 
 # ── 12. 文件上传 ──

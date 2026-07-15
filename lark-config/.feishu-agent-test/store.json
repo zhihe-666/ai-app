@@ -1,0 +1,152 @@
+{
+"default": {
+"overall": "ok",
+"tested_at": "2026-07-13T03:38:49Z",
+"items": [
+{
+"key": "auth",
+"title": "凭证鉴权",
+"status": "ok",
+"message": "飞书鉴权通过，tenant_access_token 获取成功。",
+"suggestion": null
+},
+{
+"key": "bot_info",
+"title": "Bot 信息",
+"status": "ok",
+"message": "飞书鉴权通过（Bot: 黎国友的智能助手）。",
+"suggestion": null
+},
+{
+"key": "im_channel",
+"title": "IM 渠道启用状态",
+"status": "ok",
+"message": "IM 渠道已启用且运行正常。",
+"suggestion": null
+},
+{
+"key": "inbound_hint",
+"title": "入站消息活动",
+"status": "info",
+"message": "向机器人发一条测试消息以验证入站活动。",
+"suggestion": "私聊直接发消息；群聊场景请 @机器人。"
+},
+{
+"key": "outbound_hint",
+"title": "出站消息活动",
+"status": "info",
+"message": "机器人需有发送消息的权限才能回复。",
+"suggestion": "请检查机器人发消息权限、可见范围和会话回包权限。"
+},
+{
+"key": "event_subscription",
+"title": "飞书事件订阅要求",
+"status": "info",
+"message": "飞书需要开启消息事件订阅（im.message.receive_v1）才能收消息。",
+"suggestion": "请在飞书开发者后台确认事件订阅、权限范围已配置。"
+}
+],
+"bot_name": "黎国友的智能助手",
+"lark_open_id": "ou_4fefa01f0a9740669d648771bfc3f81e"
+},
+"d8ccL9": {
+"overall": "ok",
+"tested_at": "2026-06-16T03:07:18Z",
+"items": [
+{
+"key": "auth",
+"title": "凭证鉴权",
+"status": "ok",
+"message": "飞书鉴权通过，tenant_access_token 获取成功。",
+"suggestion": null
+},
+{
+"key": "bot_info",
+"title": "Bot 信息",
+"status": "ok",
+"message": "飞书鉴权通过（Bot: 22）。",
+"suggestion": null
+},
+{
+"key": "im_channel",
+"title": "IM 渠道启用状态",
+"status": "ok",
+"message": "IM 渠道已启用且运行正常。",
+"suggestion": null
+},
+{
+"key": "inbound_hint",
+"title": "入站消息活动",
+"status": "info",
+"message": "向机器人发一条测试消息以验证入站活动。",
+"suggestion": "私聊直接发消息；群聊场景请 @机器人。"
+},
+{
+"key": "outbound_hint",
+"title": "出站消息活动",
+"status": "info",
+"message": "机器人需有发送消息的权限才能回复。",
+"suggestion": "请检查机器人发消息权限、可见范围和会话回包权限。"
+},
+{
+"key": "event_subscription",
+"title": "飞书事件订阅要求",
+"status": "info",
+"message": "飞书需要开启消息事件订阅（im.message.receive_v1）才能收消息。",
+"suggestion": "请在飞书开发者后台确认事件订阅、权限范围已配置。"
+}
+],
+"bot_name": "22",
+"lark_open_id": "ou_bb179e15e46f23ee70237a2667abc763"
+},
+"3M6AP4": {
+"overall": "ok",
+"tested_at": "2026-07-10T07:18:39Z",
+"items": [
+{
+"key": "auth",
+"title": "凭证鉴权",
+"status": "ok",
+"message": "飞书鉴权通过，tenant_access_token 获取成功。",
+"suggestion": null
+},
+{
+"key": "bot_info",
+"title": "Bot 信息",
+"status": "ok",
+"message": "飞书鉴权通过（Bot: 信息检索）。",
+"suggestion": null
+},
+{
+"key": "im_channel",
+"title": "IM 渠道启用状态",
+"status": "ok",
+"message": "IM 渠道已启用且运行正常。",
+"suggestion": null
+},
+{
+"key": "inbound_hint",
+"title": "入站消息活动",
+"status": "info",
+"message": "向机器人发一条测试消息以验证入站活动。",
+"suggestion": "私聊直接发消息；群聊场景请 @机器人。"
+},
+{
+"key": "outbound_hint",
+"title": "出站消息活动",
+"status": "info",
+"message": "机器人需有发送消息的权限才能回复。",
+"suggestion": "请检查机器人发消息权限、可见范围和会话回包权限。"
+},
+{
+"key": "event_subscription",
+"title": "飞书事件订阅要求",
+"status": "info",
+"message": "飞书需要开启消息事件订阅（im.message.receive_v1）才能收消息。",
+"suggestion": "请在飞书开发者后台确认事件订阅、权限范围已配置。"
+}
+],
+"bot_name": "信息检索",
+"lark_open_id": "ou_304f78745a38d9e48f9b8b7cda5ca42a"
+}
+}

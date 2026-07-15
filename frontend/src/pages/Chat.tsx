@@ -1,15 +1,11 @@
-import { useState, useRef, useEffect } from 'react'
-import { Typography, Input, Button, Card, Tag, Space, Avatar, Collapse, Spin } from 'antd'
-import { SendOutlined, RobotOutlined, UserOutlined, FileTextOutlined, LinkOutlined } from '@ant-design/icons'
+import { useState, useRef, useEffect, useCallback } from 'react'
+import { Typography, Input, Button, Card, Tag, Space, Avatar, Collapse, Spin, Empty, Tooltip, Popconfirm } from 'antd'
+import { SendOutlined, RobotOutlined, UserOutlined, FileTextOutlined, LinkOutlined, HistoryOutlined, DeleteOutlined, ReloadOutlined } from '@ant-design/icons'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import { listConversations, getConversation, deleteConversation, clearConversations, type ChatSessionListItem } from '../api/chat'
 
 const { Title, Text } = Typography
-
-const SUGGESTIONS = [
-  { tag: '架构概览', title: '无矩 2.0 的整体架构是什么样的？' },
-  { tag: '配置说明', title: 'DAG 调度配置包含哪些参数？' },
-  { tag: '节点配置', title: 'Kafka 渠道节点如何配置？' },
-  { tag: '算子使用', title: 'Join 算子多表关联怎么配置？' },
-]
 
 interface Source {
   collection: string
@@ -32,10 +28,81 @@ export default function Chat() {
   const msgEndRef = useRef<HTMLDivElement>(null)
   const abortRef = useRef<AbortController | null>(null)
 
+  // 历史对话
+  const [history, setHistory] = useState<ChatSessionListItem[]>([])
+  const [loadingHistory, setLoadingHistory] = useState(false)
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null)
+
+  // 加载历史列表
+  const loadHistory = useCallback(async () => {
+    setLoadingHistory(true)
+    try {
+      const data = await listConversations(50)
+      setHistory(data.conversations || [])
+    } catch {
+      // 忽略
+    } finally {
+      setLoadingHistory(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadHistory()
+  }, [loadHistory])
+
   // 自动滚动到底部
   useEffect(() => {
     msgEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, loading])
+
+  // 点击历史 → 加载详情到对话区
+  const handleHistoryClick = useCallback(async (sessionId: string) => {
+    try {
+      const detail = await getConversation(sessionId)
+      setActiveSessionId(sessionId)
+      setMessages([
+        { role: 'user', content: detail.query },
+        { role: 'assistant', content: detail.answer, sources: detail.sources || [] },
+      ])
+      setError(null)
+    } catch {
+      // 忽略
+    }
+  }, [])
+
+  // 删除单条历史
+  const handleDeleteHistory = useCallback(async (sessionId: string) => {
+    try {
+      await deleteConversation(sessionId)
+      setHistory(prev => prev.filter(h => h.id !== sessionId))
+      if (activeSessionId === sessionId) {
+        setActiveSessionId(null)
+        setMessages([])
+      }
+    } catch {
+      // 忽略
+    }
+  }, [activeSessionId])
+
+  // 清空历史
+  const handleClearHistory = useCallback(async () => {
+    try {
+      await clearConversations()
+      setHistory([])
+      setActiveSessionId(null)
+      setMessages([])
+    } catch {
+      // 忽略
+    }
+  }, [])
+
+  // 新建对话
+  const handleNewChat = useCallback(() => {
+    setActiveSessionId(null)
+    setMessages([])
+    setInput('')
+    setError(null)
+  }, [])
 
   const handleSend = async () => {
     if (!input.trim() || loading) return
@@ -147,58 +214,119 @@ export default function Chat() {
     } finally {
       setLoading(false)
       abortRef.current = null
+      // 刷新历史列表（流式结束后后端已存历史）
+      loadHistory()
     }
   }
 
-  // 点击建议问题
-  const handleSuggestionClick = (title: string) => {
-    setInput(title)
-  }
-
   return (
-    <div style={{ padding: 32, height: '100%', display: 'flex', flexDirection: 'column' }}>
-      {/* Header */}
-      <div style={{ marginBottom: 24 }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4 }}>
-          <Tag icon={<RobotOutlined />} color="purple">无矩 2.0 知识库</Tag>
-          <Text type="secondary" style={{ fontSize: 12 }}>RAG 检索增强生成 · FastAPI 微服务</Text>
-        </div>
-        <Title level={3} style={{ margin: 0 }}>知识库问答</Title>
-        <Text type="secondary">基于无矩 2.0 后端代码知识库，回答架构、API、节点配置等问题</Text>
-      </div>
-
-      {/* Messages */}
+    <div style={{ padding: 24, height: '100%', display: 'flex', gap: 16 }}>
+      {/* 左侧历史侧边栏 */}
       <Card
-        style={{
-          flex: 1,
-          overflow: 'auto',
-          marginBottom: 16,
-          display: 'flex',
-          flexDirection: 'column',
-        }}
-        bodyStyle={{ flex: 1, display: 'flex', flexDirection: 'column' }}
+        size="small"
+        style={{ width: 260, flexShrink: 0, display: 'flex', flexDirection: 'column' }}
+        bodyStyle={{ flex: 1, display: 'flex', flexDirection: 'column', padding: 0, overflow: 'hidden' }}
       >
+        <div style={{ padding: '12px 12px 8px', display: 'flex', gap: 8, borderBottom: '1px solid #f0f0f0' }}>
+          <Button type="primary" block icon={<FileTextOutlined />} onClick={handleNewChat}
+            style={{ background: '#6366f1', borderColor: '#6366f1' }}>
+            新对话
+          </Button>
+        </div>
+        <div style={{ padding: '8px 12px', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <Space size={4}>
+            <HistoryOutlined style={{ color: '#6b7280' }} />
+            <Text type="secondary" style={{ fontSize: 12 }}>历史记录</Text>
+          </Space>
+          <Space size={4}>
+            <Tooltip title="刷新">
+              <ReloadOutlined style={{ color: '#9ca3af', cursor: 'pointer', fontSize: 13 }} onClick={loadHistory} />
+            </Tooltip>
+            {history.length > 0 && (
+              <Popconfirm title="清空所有历史？" okText="清空" cancelText="取消" onConfirm={handleClearHistory}>
+                <Tooltip title="清空">
+                  <DeleteOutlined style={{ color: '#9ca3af', cursor: 'pointer', fontSize: 13 }} />
+                </Tooltip>
+              </Popconfirm>
+            )}
+          </Space>
+        </div>
+        <div style={{ flex: 1, overflow: 'auto' }}>
+          {loadingHistory ? (
+            <div style={{ textAlign: 'center', padding: 20 }}><Spin size="small" /></div>
+          ) : history.length === 0 ? (
+            <div style={{ padding: 20 }}>
+              <Empty description={<Text type="secondary" style={{ fontSize: 12 }}>暂无历史</Text>} image={Empty.PRESENTED_IMAGE_SIMPLE} />
+            </div>
+          ) : (
+            history.map(h => (
+              <div
+                key={h.id}
+                onClick={() => handleHistoryClick(h.id)}
+                style={{
+                  padding: '8px 12px',
+                  cursor: 'pointer',
+                  borderBottom: '1px solid #f8f8f8',
+                  background: activeSessionId === h.id ? '#eef2ff' : 'transparent',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 4,
+                }}
+                onMouseEnter={e => { if (activeSessionId !== h.id) e.currentTarget.style.background = '#f9fafb' }}
+                onMouseLeave={e => { if (activeSessionId !== h.id) e.currentTarget.style.background = 'transparent' }}
+              >
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{
+                    fontSize: 13,
+                    color: activeSessionId === h.id ? '#4f46e5' : '#1f2937',
+                    fontWeight: activeSessionId === h.id ? 500 : 400,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {h.title}
+                  </div>
+                  <Text type="secondary" style={{ fontSize: 11 }}>
+                    {h.created_at}
+                  </Text>
+                </div>
+                <DeleteOutlined
+                  style={{ color: '#d1d5db', fontSize: 12, flexShrink: 0 }}
+                  onClick={e => { e.stopPropagation(); handleDeleteHistory(h.id) }}
+                />
+              </div>
+            ))
+          )}
+        </div>
+      </Card>
+
+      {/* 右侧对话区 */}
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+        {/* Header */}
+        <div style={{ marginBottom: 16, display: 'flex', alignItems: 'center', gap: 8 }}>
+          <Tag icon={<RobotOutlined />} color="purple">无矩 2.0 知识库</Tag>
+          <Title level={3} style={{ margin: 0 }}>知识库问答</Title>
+        </div>
+
+        {/* Messages */}
+        <Card
+          style={{
+            flex: 1,
+            overflow: 'auto',
+            marginBottom: 16,
+            display: 'flex',
+            flexDirection: 'column',
+          }}
+          bodyStyle={{ flex: 1, display: 'flex', flexDirection: 'column' }}
+        >
         {messages.length === 0 ? (
           <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: 16 }}>
             <Avatar size={64} icon={<RobotOutlined />} style={{ background: '#6366f1' }} />
             <Title level={4} style={{ margin: 0 }}>无矩 2.0 知识库问答</Title>
-            <Text type="secondary" style={{ textAlign: 'center', maxWidth: 400 }}>
-              基于无矩 2.0 后端代码构建的 RAG 知识库，可以回答平台架构、API 接口、业务流程、节点配置等相关问题。
+            <Text type="secondary" style={{ textAlign: 'center' }}>
+              在下方输入框输入问题，开始提问
             </Text>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 8 }}>
-              {SUGGESTIONS.map((s, i) => (
-                <Card
-                  key={i}
-                  hoverable
-                  size="small"
-                  onClick={() => handleSuggestionClick(s.title)}
-                  style={{ cursor: 'pointer', textAlign: 'center' }}
-                >
-                  <Tag color="purple" style={{ marginBottom: 4 }}>{s.tag}</Tag>
-                  <div style={{ fontSize: 13, fontWeight: 500 }}>{s.title}</div>
-                </Card>
-              ))}
-            </div>
           </div>
         ) : (
           <div style={{ flex: 1 }}>
@@ -219,10 +347,18 @@ export default function Chat() {
                     background: msg.role === 'user' ? '#6366f1' : '#fff',
                     color: msg.role === 'user' ? '#fff' : '#1a202c',
                     border: msg.role === 'assistant' ? '1px solid #e2e8f0' : 'none',
-                    whiteSpace: 'pre-wrap',
+                    whiteSpace: msg.role === 'user' ? 'pre-wrap' : 'normal',
                     lineHeight: 1.6,
                   }}>
-                    {msg.content || (loading && i === messages.length - 1 ? '...' : '')}
+                    {msg.role === 'assistant' ? (
+                      <div className="chat-markdown">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                          {msg.content || (loading && i === messages.length - 1 ? '...' : '')}
+                        </ReactMarkdown>
+                      </div>
+                    ) : (
+                      msg.content || (loading && i === messages.length - 1 ? '...' : '')
+                    )}
                   </div>
                   {msg.role === 'user' && (
                     <Avatar icon={<UserOutlined />} style={{ background: '#6366f1' }} />
@@ -329,6 +465,7 @@ export default function Chat() {
         >
           发送
         </Button>
+      </div>
       </div>
     </div>
   )

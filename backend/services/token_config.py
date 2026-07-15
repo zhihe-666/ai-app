@@ -5,8 +5,11 @@
 import os
 import re
 
-# 原始 skill 脚本路径
-_SKILL_SCRIPT = "/Users/admin/.dewuclaw/workspaces/default/skills/ai-measure-query/scripts/ai_measure.py"
+# 原始 skill 脚本路径（容器内通常不存在，依赖环境变量 EP_TOKEN）
+_SKILL_SCRIPT = os.environ.get(
+    "AI_MEASURE_SCRIPT",
+    "/Users/admin/.dewuclaw/workspaces/default/skills/ai-measure-query/scripts/ai_measure.py"
+)
 
 
 def _load_default_token():

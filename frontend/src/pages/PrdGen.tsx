@@ -10,13 +10,13 @@
 import React, { useState, useRef, useCallback } from 'react'
 import {
   Typography, Input, Button, Card, Steps, Tag, Space, Alert, message,
-  Upload, Table, Modal, Spin, Empty, Radio, Checkbox, Divider,
+  Upload, Table, Modal, Spin, Empty, Radio, Checkbox, Divider, Select, Descriptions,
 } from 'antd'
 import {
   ThunderboltOutlined, FileTextOutlined, LinkOutlined,
   UploadOutlined, SendOutlined, ReloadOutlined,
-  DownloadOutlined, EditOutlined, EyeOutlined,
-  CheckCircleOutlined, LoadingOutlined, RightCircleOutlined,
+  DownloadOutlined, EditOutlined, EyeOutlined, CheckCircleOutlined, LoadingOutlined,
+  RightCircleOutlined,
 } from '@ant-design/icons'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -25,12 +25,15 @@ import {
   createSession, simpleGenerate, startChat, chatRound,
   generateOutline, generateSection, regenerateSection,
   updateSection, getVersions, getVersionContent,
-  exportPRD, uploadFile, parseMinutes, rechatTopic,
+  exportPRD, uploadFile, parseMinutes, rechatTopic, exportPRDToFeishu, deepGenerate, approveGate, deepPrototype,
 } from '../api/prdGen'
 import type {
   SectionEvent, SectionCompleteEvent, ChatRoundResponse,
   VersionInfo, VersionContent,
+  AgentCompleteEvent, GateEvent, ValidationEvent, ValidationIssue,
 } from '../api/prdGen'
+import type { RegistryComponent } from '../api/kbManage'
+import { getComponentRegistry } from '../api/kbManage'
 
 const { Title, Text } = Typography
 const { TextArea } = Input
@@ -74,7 +77,7 @@ interface VersionDisplay {
 export default function PrdGen() {
   // ── 会话状态 ──
   const [sessionId, setSessionId] = useState<string | null>(null)
-  const [mode, setMode] = useState<'simple' | 'medium'>('simple')
+  const [mode, setMode] = useState<'simple' | 'medium' | 'deep'>('simple')
   const [sessionStatus, setSessionStatus] = useState<'init' | 'chatting' | 'writing' | 'done'>('init')
 
   // ── 输入状态 ──
@@ -83,6 +86,9 @@ export default function PrdGen() {
   const [minutesResult, setMinutesResult] = useState<any>(null)
   const [parsingMinutes, setParsingMinutes] = useState(false)
   const [uploadedFiles, setUploadedFiles] = useState<any[]>([])
+  const [ragEnabled, setRagEnabled] = useState(true)
+  const [exportingFeishu, setExportingFeishu] = useState(false)
+  const [fetchingRegistry, setFetchingRegistry] = useState(false)
   const [uploading, setUploading] = useState(false)
 
   // 输入源勾选（可多选）
@@ -106,6 +112,20 @@ export default function PrdGen() {
   const [sectionStatuses, setSectionStatuses] = useState<Record<string, StepStatus>>({})
   const [currentSection, setCurrentSection] = useState<string | null>(null)
   const [streamingContent, setStreamingContent] = useState('')
+
+  // -- Deep Mode --
+  const [deepAgents, setDeepAgents] = useState<Record<string, AgentCompleteEvent>>({})
+  const [deepIssues, setDeepIssues] = useState<ValidationIssue[]>([])
+  const [currentGate, setCurrentGate] = useState<GateEvent | null>(null)
+  const [gateModifications, setGateModifications] = useState('')
+  const [gateEditItems, setGateEditItems] = useState<Record<string, any>>({})
+  const [deepProgress, setDeepProgress] = useState<string>('')
+  const [componentRegistry, setComponentRegistry] = useState<RegistryComponent[] | null>(null)
+  const [prototyping, setPrototyping] = useState(false)
+  const [editingDeep, setEditingDeep] = useState(false)
+  const [deepEditContent, setDeepEditContent] = useState('')
+  const [deepShowDiff, setDeepShowDiff] = useState(false)
+  const [deepOldContent, setDeepOldContent] = useState('')
   const abortRef = useRef<AbortController | null>(null)
   const genIdRef = useRef(0)
 
@@ -121,6 +141,18 @@ export default function PrdGen() {
   const [versionsModalOpen, setVersionsModalOpen] = useState(false)
   const [versionSection, setVersionSection] = useState<string | null>(null)
 
+  const DEEP_STEPS = ['需求萃取', '平台上下文分析', '功能规格定义', 'PRD 撰写', '原型生成']
+  const deepStepCurrent = (() => {
+    const keys = Object.keys(deepAgents).filter(k => k.startsWith('agent') && deepAgents[k]?.data)
+    if (sessionStatus === 'done') return 5
+    if (keys.includes('agent5')) return 4
+    if (keys.includes('agent4')) return 3
+    if (keys.includes('agent3')) return 2
+    if (keys.includes('agent2')) return 1
+    if (keys.includes('agent1')) return 0
+    return 0
+  })()
+
   // ── 步骤条 ──
   const stepsCurrent = sessionStatus === 'init' ? 0
     : sessionStatus === 'chatting' ? 1
@@ -129,18 +161,23 @@ export default function PrdGen() {
     : 3
 
   // 步骤条标题随模式变化
+  const stepIcon = (status: string) => {
+    if (status === 'finish') return <CheckCircleOutlined style={{ color: '#52c41a' }} />
+    if (status === 'process' && generating) return <LoadingOutlined style={{ color: '#6366f1' }} />
+    return undefined
+  }
+  const st = (s: string) => s as 'finish' | 'process' | 'wait'
   const stepItems = [
-    { title: '输入需求', status: (sessionId ? 'finish' : 'process') as 'finish' | 'process' },
+    { title: '输入需求', status: st(sessionId ? 'finish' : 'process'), icon: stepIcon(st(sessionId ? 'finish' : 'process')) },
     { title: mode === 'medium' ? '补充信息' : '生成大纲',
-      status: sessionStatus === 'init' ? 'wait' as const
-        : sessionStatus === 'chatting' ? 'process' as const
-        : sessionStatus === 'writing' || sessionStatus === 'done' ? 'finish' as const
-        : 'wait' as const,
+      status: st(sessionStatus === 'init' ? 'wait' : sessionStatus === 'chatting' ? 'process' : sessionStatus === 'writing' || sessionStatus === 'done' ? 'finish' : 'wait'),
+      icon: stepIcon(st(sessionStatus === 'init' ? 'wait' : sessionStatus === 'chatting' ? 'process' : sessionStatus === 'writing' || sessionStatus === 'done' ? 'finish' : 'wait')),
     },
     { title: '撰写章节',
-      status: outline.length > 0 ? (Object.keys(sectionContents).length > 0 ? 'finish' as const : 'process' as const) : 'wait' as const,
+      status: st(outline.length > 0 ? (Object.keys(sectionContents).length > 0 ? 'finish' : 'process') : 'wait'),
+      icon: stepIcon(st(outline.length > 0 ? (Object.keys(sectionContents).length > 0 ? 'finish' : 'process') : 'wait')),
     },
-    { title: '完成', status: sessionStatus === 'done' ? 'finish' as const : 'wait' as const },
+    { title: '完成', status: st(sessionStatus === 'done' ? 'finish' : 'wait'), icon: stepIcon(st(sessionStatus === 'done' ? 'finish' : 'wait')) },
   ]
 
   // ── 创建会话 ──
@@ -157,12 +194,11 @@ export default function PrdGen() {
       message.success('会话已创建')
 
       if (mode === 'simple') {
-        // 直接开始生成
         await handleSimpleGenerate(session.sessionId)
+      } else if (mode === 'deep') {
+        await handleDeepGenerate(session.sessionId)
       } else {
-        // 进入问答阶段
         setSessionStatus('chatting')
-        // 调用 startChat 获取第一个引导问题
         await handleStartChat(session.sessionId)
       }
     } catch (e: any) {
@@ -223,6 +259,48 @@ export default function PrdGen() {
       setGenerating(false)
       message.error(e?.message || '生成异常')
     }
+  }
+
+  // ── 深度模式 ──
+  const handleDeepGenerate = async (sid: string) => {
+    if (abortRef.current) abortRef.current.abort()
+    const controller = new AbortController(); abortRef.current = controller
+    setGenerating(true); setDeepAgents({}); setDeepIssues([]); setCurrentGate(null)
+    setDeepProgress(''); setSessionStatus('writing'); setSectionContents({}); setOutline([])
+    if (!componentRegistry && !fetchingRegistry) {
+      setFetchingRegistry(true)
+      getComponentRegistry().then(r => { setComponentRegistry(r||null); setFetchingRegistry(false) }).catch(() => setFetchingRegistry(false))
+    }
+    try {
+      await deepGenerate(sid, {
+        onProgress: (d) => d?.message && setDeepProgress(d.message),
+        onAgentComplete: (d) => { if (d?.agent) setDeepAgents(p => ({...p, [d.agent]: d})) },
+        onGate: (d) => {
+          setCurrentGate(d); setGateModifications(''); const items: Record<string, any> = {}
+          if (d.conflicts) d.conflicts.forEach((c,i) => { items['c_'+i] = {action:'accept',text:'',orig:c} })
+          if (d.impact_warnings) d.impact_warnings.forEach((w,i) => { items['i_'+i] = {keep:true, edit_text:w.warning,orig:w} })
+          if (d.features) d.features.forEach((f,i) => { items['f_'+i] = {keep:true, name:f.name,priority:f.priority,orig:f} })
+          setGateEditItems(items)
+        },
+        onValidation: (d) => d?.issues && setDeepIssues(p => [...p, ...d.issues]),
+        onComplete: (d) => { setGenerating(false); setSessionStatus('done'); setDeepProgress(''); d?.message && message.success(d.message) },
+        onError: (d) => { setGenerating(false); d?.message && message.error(d.message) },
+      }, controller.signal, ragEnabled)
+    } catch (e: any) { if (e.name !== 'AbortError') { setGenerating(false); message.error(e.message||'') } }
+  }
+
+  const handleApproveGate = async (approved: boolean) => {
+    if (!sessionId || !currentGate) return
+    const gate = currentGate.gate; const g = currentGate; setCurrentGate(null)
+    const mods = { text: gateModifications, edits: gateEditItems }
+    try {
+      await approveGate(sessionId, gate, approved, JSON.stringify(mods))
+      if (!approved && gate !== 'prototype' && gate !== 'agent1_review') { setGenerating(false); message.info('rejected') }
+    } catch (e: any) { message.error(e.message||'fail'); setCurrentGate(g) }
+  }
+
+  const updateGateItem = (key: string, updates: Record<string, any>) => {
+    setGateEditItems(p => ({...p, [key]: {...p[key], ...updates}}))
   }
 
   // ── 中等模式对话 ──
@@ -491,6 +569,12 @@ export default function PrdGen() {
   }
 
   // ── 导出 ──
+  const handleExportFeishu = async () => {
+    if (!sessionId) return; setExportingFeishu(true)
+    try { const r = await exportPRDToFeishu(sessionId); if (r?.url) { window.open(r.url, '_blank'); message.success('feishu ok') } else message.error('no url') }
+    catch(e: any) { message.error(e?.message||'fail') } finally { setExportingFeishu(false) }
+  }
+
   const handleExport = () => {
     if (!sessionId) return
     exportPRD(sessionId)
@@ -598,6 +682,7 @@ export default function PrdGen() {
           }}>
             <Radio value="simple">简单模式</Radio>
             <Radio value="medium">中等模式（问答引导）</Radio>
+            <Radio value="deep">深度模式</Radio>
           </Radio.Group>
         </div>
 
@@ -611,6 +696,7 @@ export default function PrdGen() {
             <Checkbox value="text">文字描述</Checkbox>
             <Checkbox value="minutes">飞书妙记</Checkbox>
             <Checkbox value="file">上传文件</Checkbox>
+            <Checkbox value="rag">参考历史 PRD</Checkbox>
           </Checkbox.Group>
         </div>
 
@@ -694,12 +780,14 @@ export default function PrdGen() {
             loading={generating}
             disabled={generating || !!sessionId}
           >
-            {mode === 'simple' ? '开始生成' : '开始对话'}
+            {mode === 'medium' ? '开始对话' : '开始生成'}
           </Button>
           {sessionId && (
             <Button icon={<ReloadOutlined />} onClick={handleReset}>重新开始</Button>
           )}
         </Space>
+
+        {mode !== 'deep' && <Steps current={stepsCurrent} items={stepItems} style={{ marginTop: 8 }} />}
       </Space>
     </Card>
   )
@@ -885,6 +973,98 @@ export default function PrdGen() {
     )
   }
 
+  const renderAgentCard = (key: string, ad: any, label: string) => (
+    <Card key={key} type="inner" size="small"
+      title={<Space><CheckCircleOutlined style={{ color: '#52c41a' }} /><Text strong>{label}</Text></Space>}
+      style={{ marginBottom: 12 }}>
+      <pre style={{ margin:0, maxHeight:240, overflow:'auto', fontSize:12, background:'#fafafa', padding:8, borderRadius:4 }}>
+        {JSON.stringify(ad.data, null, 2)}
+      </pre>
+    </Card>
+  )
+
+  const handleViewProto = () => {
+    if (deepAgents['agent5']?.data?.html) window.open(URL.createObjectURL(new Blob([deepAgents['agent5'].data.html], {type:'text/html;charset=utf-8'})), '_blank')
+  }
+  const handleDownloadProto = () => {
+    if (!deepAgents['agent5']?.data?.html) return
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([deepAgents['agent5'].data.html], {type:'text/html;charset=utf-8'})); a.download = 'prototype.html'; a.click()
+  }
+
+  const renderDeepSection = () => {
+    if (mode !== 'deep') return null
+    const md = sectionContents['deep_prd'] || deepAgents['agent4']?.data?.prd_markdown || ''
+    return (
+      <Card title="深度模式" size="small" style={{ marginBottom: 16 }}>
+        <Steps current={deepStepCurrent} size="small" items={DEEP_STEPS.map((label, idx) => {
+          const isBefore = !sessionId || Object.keys(deepAgents).length === 0
+          const status = isBefore ? 'wait' as const : (idx < deepStepCurrent ? 'finish' : idx === deepStepCurrent ? 'process' : 'wait') as 'finish' | 'process' | 'wait'
+          return { title: label, status, icon: status === 'finish' ? <CheckCircleOutlined style={{ color: '#52c41a' }} /> : (status === 'process' && generating) ? <LoadingOutlined style={{ color: '#6366f1' }} /> : undefined }
+        })} style={{ marginBottom: 16 }} />
+        {deepAgents['agent1'] && renderAgentCard('agent1', deepAgents['agent1'], '需求萃取')}
+        {deepAgents['agent2'] && renderAgentCard('agent2', deepAgents['agent2'], '平台上下文分析')}
+        {deepAgents['agent3'] && renderAgentCard('agent3', deepAgents['agent3'], '功能规格定义')}
+        {deepAgents['agent4'] && renderAgentCard('agent4', deepAgents['agent4'], 'PRD 撰写')}
+        {deepAgents['agent5'] && renderAgentCard('agent5', deepAgents['agent5'], '原型生成')}
+        {generating && deepProgress && <Alert type="info" showIcon message={deepProgress} icon={<LoadingOutlined />} style={{ marginBottom:12 }} />}
+        {deepIssues.length > 0 && <Alert type="warning" showIcon message={'checks: '+deepIssues.length} style={{ marginBottom:12 }} />}
+
+        {/* PRD preview + edit */}
+        {deepAgents['agent4']?.data?.prd_markdown && (
+          <Card type="inner" size="small" title={editingDeep ? '编辑 PRD' : 'PRD 预览'} style={{ marginBottom: 12 }}
+            extra={
+              <Space>
+                {!editingDeep && <Button size="small" onClick={()=>{ setDeepEditContent(md); setDeepOldContent(md); setEditingDeep(true); setDeepShowDiff(false) }}><EditOutlined /> 编辑</Button>}
+                {editingDeep && <>
+                  <Button size="small" onClick={()=>setEditingDeep(false)}>取消</Button>
+                  <Button size="small" type="primary" onClick={async()=>{ try{await updateSection(sessionId!,'deep_prd',deepEditContent); setSectionContents(p=>({...p,deep_prd:deepEditContent})); setEditingDeep(false); message.success('保存成功') }catch(e:any){message.error(e.message||'fail')} }}>保存</Button>
+                  <Button size="small" onClick={()=>{setDeepShowDiff(!deepShowDiff); setNewContent(deepEditContent)}}>{deepShowDiff?'隐藏 diff':'对比'}</Button>
+                </>}
+                <Button size="small" onClick={()=>handleShowVersions('deep_prd')}>版本</Button>
+                <Button size="small" onClick={()=>sessionId && exportPRD(sessionId)}><DownloadOutlined /> 导出</Button>
+                <Button size="small" onClick={handleExportFeishu} loading={exportingFeishu}><LinkOutlined /> 飞书</Button>
+                {deepAgents['agent5']?.data?.html && <>
+                  <Button size="small" onClick={handleViewProto}><EyeOutlined /> 查看原型</Button>
+                  <Button size="small" onClick={handleDownloadProto}><DownloadOutlined /> 下载原型</Button>
+                </>}
+              </Space>
+            }>
+            {deepShowDiff && <ReactDiffViewer oldValue={deepOldContent} newValue={newContent} splitView={false} leftTitle="原版" rightTitle="新版" styles={{}} />}
+            {editingDeep ? (
+              <Input.TextArea rows={20} value={deepEditContent} onChange={e=>setDeepEditContent(e.target.value)} style={{ fontFamily:'monospace', fontSize:13 }} />
+            ) : (
+              <div style={{ maxHeight:500, overflow:'auto', padding:12, background:'#fff', border:'1px solid #f0f0f0', borderRadius:8, lineHeight:1.8, whiteSpace:'pre-wrap' }}>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{md.replace(/\\n/g, '\n')}</ReactMarkdown>
+              </div>
+            )}
+          </Card>
+        )}
+
+        {/* Prototype section */}
+        {deepAgents['agent4']?.data?.prd_markdown && (
+          <Card type="inner" size="small" title="产品原型" style={{ marginBottom:12 }}>
+            {deepAgents['agent5']?.data?.html ? (
+              <Space direction="vertical" style={{width:'100%'}}>
+                <Alert type="success" showIcon message="原型已生成" />
+                <iframe srcDoc={deepAgents['agent5'].data.html} style={{width:'100%',height:500,border:'1px solid #e8e8e8',borderRadius:8}} title="preview" />
+                <Space><Button onClick={handleViewProto}><EyeOutlined /> 新窗口</Button><Button onClick={handleDownloadProto}><DownloadOutlined /> 下载 HTML</Button></Space>
+              </Space>
+            ) : (
+              <Space direction="vertical" style={{width:'100%'}}>
+                <Text>基于 PRD 内容生成 AI 增强原型</Text>
+                <Button type="primary" loading={prototyping} onClick={async()=>{
+                  if(!sessionId)return; setPrototyping(true)
+                  try{const r=await deepPrototype(sessionId); if(r?.html){setDeepAgents(p=>({...p,agent5:{agent:'agent5',data:r,message:'done'}})); message.success('原型已生成')}else message.warning('empty')}
+                  catch(e:any){message.error(e.message||'fail')}finally{setPrototyping(false)}
+                }}><EyeOutlined /> 生成产品原型</Button>
+              </Space>
+            )}
+          </Card>
+        )}
+      </Card>
+    )
+  }
+
   const renderOutlineSection = () => {
     if (outline.length === 0 && sessionStatus === 'writing' && mode === 'simple') {
       return (
@@ -1042,13 +1222,15 @@ export default function PrdGen() {
       </Title>
 
       {/* 步骤条 */}
-      <Steps current={stepsCurrent} items={stepItems} style={{ marginBottom: 24 }} />
+      
 
       {/* 输入区 */}
       {renderInputSection()}
 
       {/* 中等模式对话区 */}
       {renderChatSection()}
+      {/* 深度模式 */}
+      {renderDeepSection()}
 
       {/* 大纲 + 章节列表 */}
       {renderOutlineSection()}
@@ -1062,6 +1244,110 @@ export default function PrdGen() {
           <Empty description="输入需求描述并点击按钮开始生成 PRD" />
         </Card>
       )}
+
+      {/* Gate Modal with editing */}
+      <Modal title={'闸口: '+(currentGate?.gate==='agent1_review'?'需求萃取审核':currentGate?.gate||'')} open={!!currentGate}
+        onCancel={()=>handleApproveGate(false)} footer={null} width={700} maskClosable={false} closable={false}>
+        {currentGate && <div>
+          <Alert type="warning" showIcon message={currentGate.message||''} style={{ marginBottom:12 }} />
+
+          {/* agent1_review: requirements display */}
+          {currentGate.gate==='agent1_review' && currentGate.requirements && (
+            <Card size="small" style={{ marginBottom:12, background:'#f0f5ff' }}>
+              <Descriptions column={1} size="small">
+                <Descriptions.Item label="功能">{(currentGate.requirements as any).feature_name||'-'}</Descriptions.Item>
+                <Descriptions.Item label="问题">{((currentGate.requirements as any).problem||'').slice(0,300)||'-'}</Descriptions.Item>
+                <Descriptions.Item label="方案">{((currentGate.requirements as any).solution_direction||'').slice(0,300)||'-'}</Descriptions.Item>
+                <Descriptions.Item label="用户">{((currentGate.requirements as any).target_users||[]).join(', ')||'-'}</Descriptions.Item>
+                <Descriptions.Item label="核心功能">{((currentGate.requirements as any).core_features||[]).join(', ')||'-'}</Descriptions.Item>
+                <Descriptions.Item label="P0">{((currentGate.requirements as any).priorities?.P0||[]).join(', ')||'-'}</Descriptions.Item>
+                <Descriptions.Item label="P1">{((currentGate.requirements as any).priorities?.P1||[]).join(', ')||'-'}</Descriptions.Item>
+              </Descriptions>
+            </Card>
+          )}
+          {currentGate.gate==='agent1_review' && currentGate.gaps && currentGate.gaps.length>0 && (
+            <Card size="small" style={{ marginBottom:12, background:'#fffbe6' }}>
+              <Text strong>信息缺口:</Text><ul style={{ margin:'6px 0', paddingLeft:20 }}>
+                {(currentGate.gaps as string[]).map((g,i) => <li key={i}><Text type="warning">{g}</Text></li>)}
+              </ul>
+            </Card>
+          )}
+
+          {/* conflicts - editable */}
+          {currentGate.conflicts && currentGate.conflicts.length>0 && (
+            <div style={{ marginBottom:12 }}>
+              <Text strong>冲突 (可逐条处理):</Text>
+              {currentGate.conflicts.map((c:any,i:number) => {
+                const key='c_'+i; const e=gateEditItems[key]||{action:'accept',text:''}
+                return <Card key={i} size="small" style={{ marginTop:6, background:'#fffbe6' }}>
+                  <Text strong>{c.field}</Text>
+                  <div style={{ fontSize:12, color:'#666' }}>来源: {(c.sources||[]).join(' vs ')}</div>
+                  {c.resolution && <div style={{ fontSize:12 }}>建议: {c.resolution}</div>}
+                  <Radio.Group value={e.action} onChange={v=>updateGateItem(key,{action:v.target.value})} size="small" style={{ marginTop:4 }}>
+                    <Radio.Button value="accept">采纳</Radio.Button>
+                    <Radio.Button value="ignore">忽略</Radio.Button>
+                    <Radio.Button value="edit">修改</Radio.Button>
+                  </Radio.Group>
+                  {e.action==='edit' && <Input size="small" style={{width:300,marginTop:4}} value={e.text} onChange={v=>updateGateItem(key,{text:v.target.value})} />}
+                </Card>
+              })}
+            </div>
+          )}
+
+          {/* impact_warnings - editable */}
+          {currentGate.impact_warnings && currentGate.impact_warnings.length>0 && (
+            <div style={{ marginBottom:12 }}>
+              <Text strong>影响范围 (可勾选保留/编辑):</Text>
+              {currentGate.impact_warnings.map((w:any,i:number) => {
+                const key='i_'+i; const e=gateEditItems[key]||{keep:true,edit_text:w.warning}
+                return <Card key={i} size="small" style={{ marginTop:6, background:'#fff7e6' }}>
+                  <Space><Checkbox checked={e.keep} onChange={v=>updateGateItem(key,{keep:v.target.checked})} />
+                    <Tag color={w.priority==='P0'?'red':'orange'}>{w.priority}</Tag>
+                    <Text strong style={{textDecoration:e.keep?'none':'line-through',color:e.keep?'inherit':'#999'}}>{w.area}</Text>
+                  </Space>
+                  <Input.TextArea size="small" rows={2} value={e.edit_text} onChange={v=>updateGateItem(key,{edit_text:v.target.value})}
+                    style={{marginTop:4,fontSize:12}} />
+                </Card>
+              })}
+            </div>
+          )}
+
+          {/* features - editable table */}
+          {currentGate.features && currentGate.features.length>0 && (
+            <div style={{ marginBottom:12 }}>
+              <Text strong>功能规格 ({currentGate.features.length} 项):</Text>
+              <Table size="small" dataSource={currentGate.features} rowKey="id" pagination={false}>
+                <Table.Column title="ID" dataIndex="id" width={50} />
+                <Table.Column title="功能" dataIndex="name" render={(name:string,_:any,idx:number)=>{
+                  const e=gateEditItems['f_'+idx]; if(!e||e.keep===false) return <Text delete>{name}</Text>
+                  return <Input size="small" value={e.name??name} onChange={v=>updateGateItem('f_'+idx,{name:v.target.value})} />
+                }} />
+                <Table.Column title="优先级" dataIndex="priority" width={80} render={(p:string,_:any,idx:number)=>{
+                  const e=gateEditItems['f_'+idx]; if(!e||e.keep===false) return <Tag>已移除</Tag>
+                  return <Select size="small" value={e.priority??p} onChange={v=>updateGateItem('f_'+idx,{priority:v})} style={{width:65}}>
+                    <Select.Option value="P0">P0</Select.Option><Select.Option value="P1">P1</Select.Option><Select.Option value="P2">P2</Select.Option>
+                  </Select>
+                }} />
+                <Table.Column title="" width={50} render={(_:any,__:any,idx:number)=>{
+                  const e=gateEditItems['f_'+idx]; const removed=e?.keep===false
+                  return <Button size="small" danger={!removed} type={removed?'default':'dashed'} onClick={()=>updateGateItem('f_'+idx,{keep:removed})}>{removed?'恢复':'移除'}</Button>
+                }} />
+              </Table>
+            </div>
+          )}
+
+          <Divider />
+          <Input.TextArea rows={2} placeholder="补充说明（可选）..." value={gateModifications} onChange={e=>setGateModifications(e.target.value)} style={{ marginBottom:12 }} />
+          <Space style={{ justifyContent:'flex-end', width:'100%' }}>
+            <Button danger onClick={()=>handleApproveGate(false)}>
+              {currentGate.gate==='agent1_review'?'修改需求(继续)':'驳回(终止)'}
+            </Button>
+            <Button type="primary" onClick={()=>handleApproveGate(true)}>
+              {currentGate.gate==='agent1_review'?'确认,继续':'确认'}
+            </Button>
+          </Space>
+        </div>}
+      </Modal>
 
       {/* 版本管理 Modal */}
       <Modal

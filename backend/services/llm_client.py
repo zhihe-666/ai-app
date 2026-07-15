@@ -46,6 +46,7 @@ class LLMClient:
         self.client = OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
+            timeout=300,  # 全局超时 300s，防止 LLM 调用永久挂起（Agent4 12K tokens 约需 60s，pro 更久）
         )
 
     def chat(
@@ -55,6 +56,7 @@ class LLMClient:
         temperature: float = 0.3,
         max_tokens: int = 4096,
         seed: int | None = None,
+        timeout: int | None = None,
     ) -> str:
         """通用 Chat 调用
 
@@ -64,12 +66,13 @@ class LLMClient:
             temperature: 温度参数，默认 0.3（偏确定）
             max_tokens: 最大输出 token 数
             seed: 随机种子（设置后相同输入保证相同输出）
+            timeout: 请求超时秒数，默认 None（用客户端全局 300s）
 
         Returns:
             LLM 回复文本
 
         Raises:
-            Exception: API 调用失败
+            Exception: API 调用失败 或 超时
         """
         kwargs = dict(
             model=self.model,
@@ -82,6 +85,8 @@ class LLMClient:
         )
         if seed is not None:
             kwargs["seed"] = seed
+        if timeout is not None:
+            kwargs["timeout"] = timeout  # 仅非 None 时传，避免覆盖客户端 300s 默认
         resp = self.client.chat.completions.create(**kwargs)
         return resp.choices[0].message.content or ""
 
@@ -91,6 +96,7 @@ class LLMClient:
         user: str,
         temperature: float = 0.3,
         max_tokens: int = 4096,
+        timeout: int | None = None,
     ):
         """流式 Chat 调用，逐 chunk yield 内容
 
@@ -105,7 +111,7 @@ class LLMClient:
         Yields:
             逐 token 内容字符串
         """
-        resp = self.client.chat.completions.create(
+        call_kwargs = dict(
             model=self.model,
             messages=[
                 {"role": "system", "content": system},
@@ -115,6 +121,9 @@ class LLMClient:
             max_tokens=max_tokens,
             stream=True,
         )
+        if timeout is not None:
+            call_kwargs["timeout"] = timeout
+        resp = self.client.chat.completions.create(**call_kwargs)
         for chunk in resp:
             if chunk.choices and len(chunk.choices) > 0:
                 delta = chunk.choices[0].delta

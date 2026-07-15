@@ -17,6 +17,8 @@ import logging
 import os
 import uuid
 
+import requests
+
 from .db import (
     create_prd_session, get_prd_session, update_prd_session,
     save_prd_version, get_prd_versions, get_prd_version_content,
@@ -27,6 +29,11 @@ from .llm_client import LLMClient
 from .sse_helpers import sse_event
 
 logger = logging.getLogger(__name__)
+
+# 无矩2.0 知识库微服务基地址（RAG 检索 + 后续图谱查询共用）
+KB_BASE_URL = os.environ.get('KB_BASE_URL', 'http://localhost:8000')
+# 历史 PRD 集合名（待用户提供历史 PRD 后导入）
+PRD_HISTORY_COLLECTION = 'prd_history'
 
 
 # ── Prompt 模板 ──
@@ -537,8 +544,11 @@ class PRDGenService:
         return default
 
     @staticmethod
-    def _build_collected_info_text(session: dict) -> str:
-        """从 collected_info 和 user_input 构建信息文本（入 LLM Prompt）"""
+    def _build_collected_info_text(session: dict, current_section: str = '', rag_enabled: bool = True) -> str:
+        """从 collected_info 和 user_input 构建信息文本（入 LLM Prompt）
+
+        可选注入 RAG 参考片段（历史 PRD），降级时返回空串不影响生成。
+        """
         parts = []
 
         user_input = session.get('user_input', '').strip()
@@ -565,7 +575,304 @@ class PRDGenService:
         if minutes.get('background'):
             parts.append(f'【会议提取】背景: {minutes["background"]}')
 
+        # RAG 参考上下文（历史 PRD），降级空串
+        if rag_enabled and current_section:
+            rag_context = PRDGenService._retrieve_reference_context(session, current_section)
+            if rag_context:
+                parts.append(rag_context)
+
         return '\n\n'.join(parts) if parts else '（暂无补充信息）'
+
+    @staticmethod
+    def _query_kb_agent(question: str) -> list[dict]:
+        """调用知识库非流式查询 /api/query，获取相关上下文片段
+
+        返回 [{content, collection, score, metadata}, ...]。
+        降级：微服务挂/超时 → 空列表。
+        """
+        if not (question or '').strip():
+            return []
+        try:
+            resp = requests.post(
+                f'{KB_BASE_URL}/api/query',
+                json={'query': question.strip()[:500]},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return data.get('contexts', []) or []
+        except requests.exceptions.ConnectionError:
+            logger.warning('[PRDGen] KB 问答查询失败: 微服务未启动')
+            return []
+        except requests.exceptions.Timeout:
+            logger.warning('[PRDGen] KB 问答查询超时')
+            return []
+        except Exception as e:
+            logger.warning(f'[PRDGen] KB 问答查询异常: {e}')
+            return []
+
+    @staticmethod
+    def _retrieve_reference_context(session: dict, current_section: str) -> str:
+        """从知识库检索与当前 PRD 需求最相似的历史 PRD 片段（Few-shot 参考）
+
+        调无矩2.0 /api/query/stream，collection=prd_history，取前 3 片段各截断 500 字。
+        降级链路：
+          - 微服务未启动 → 空串（日志 warning）
+          - 无 prd_history 集合/无结果 → 空串（日志 info）
+          - 检索异常 → 空串（日志 warning）
+        无数据时不阻塞 PRD 生成，仅损失参考能力。
+        """
+        user_input = (session.get('user_input', '') or '').strip()
+        section_name = _SECTION_NAMES.get(current_section, current_section)
+        query = f'{user_input} {section_name}'.strip()[:200]
+
+        if not query.strip():
+            return ''
+
+        try:
+            resp = requests.post(
+                f'{KB_BASE_URL}/api/query/stream',
+                json={
+                    'query': query,
+                    'collections': [PRD_HISTORY_COLLECTION],
+                    'top_k': 3,
+                    'similarity_threshold': 0.5,
+                    'page_size': 3,
+                },
+                timeout=15,
+                stream=True,
+            )
+        except requests.exceptions.ConnectionError:
+            logger.warning('[PRDGen] RAG 检索失败: 知识库服务未启动')
+            return ''
+        except requests.exceptions.Timeout:
+            logger.warning('[PRDGen] RAG 检索超时')
+            return ''
+        except Exception as e:
+            logger.warning(f'[PRDGen] RAG 检索异常: {e}')
+            return ''
+
+        # 解析 SSE 响应，提取 sources（事件格式与 chat.py 一致）
+        sources = []
+        try:
+            for raw_line in resp.iter_lines():
+                if not raw_line:
+                    continue
+                line = raw_line.decode('utf-8', errors='ignore')
+                if not line.startswith('data: '):
+                    continue
+                try:
+                    data = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                # 优先取 sources 事件；兜底取 token 累积中的 sources 字段
+                if data.get('type') == 'sources' or 'sources' in data:
+                    src = data.get('sources', [])
+                    if src:
+                        sources = src
+        except Exception as e:
+            logger.warning(f'[PRDGen] RAG SSE 解析异常: {e}')
+            return ''
+
+        if not sources:
+            logger.info(f'[PRDGen] RAG 检索无结果: query="{query}"')
+            return ''
+
+        parts = ['【参考历史PRD片段】']
+        for i, src in enumerate(sources[:3], 1):
+            title = src.get('title', '未知PRD')
+            content = (src.get('content', '') or '')[:500]
+            score = src.get('score', '')
+            score_str = f' (相似度: {score:.2f})' if isinstance(score, (int, float)) else ''
+            parts.append(f'参考{i}：「{title}」{score_str}\n{content}')
+
+        parts.append('')
+        parts.append('⚠️ 以上为历史PRD参考，当前PRD应基于实际需求设计，不要盲目照搬。')
+        logger.info(f'[PRDGen] RAG 检索到 {len(sources)} 个参考片段')
+        return '\n\n'.join(parts)
+
+    # ── 深度模式 Agent 2：平台上下文分析（调知识库图谱）──
+
+    @staticmethod
+    def _kb_graph_get(path: str, params: dict = None, timeout: int = 10) -> dict | None:
+        """直连知识库图谱 API（不经 Flask 代理，供深度模式内部调用）
+
+        降级：微服务挂/超时/异常 → None。
+        """
+        try:
+            resp = requests.get(f'{KB_BASE_URL}/api/admin{path}', params=params, timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get('status') == 'success':
+                return data.get('data')
+            return None
+        except requests.exceptions.ConnectionError:
+            logger.warning('[PRDGen] 图谱 API 未连接（微服务未启动）')
+            return None
+        except requests.exceptions.Timeout:
+            logger.warning(f'[PRDGen] 图谱 API 超时（>{timeout}s）: {path}')
+            return None
+        except Exception as e:
+            logger.warning(f'[PRDGen] 图谱 API 异常 ({path}): {e}')
+            return None
+
+    @staticmethod
+    def _match_module(user_input: str, modules: list[dict]) -> str | None:
+        """从 12 模块清单中匹配与用户需求最相关的模块名
+
+        策略：user_input 包含 module_name 的子串，或 module_name 的关键词（backend_keywords）
+        出现在 user_input 中。多命中取 controller_count 最大的（数据最丰富）。
+        """
+        if not user_input or not modules:
+            return None
+        text = user_input
+        candidates = []
+        for m in modules:
+            name = m.get('module_name', '')
+            if name and name in text:
+                candidates.append((m, len(name)))
+            else:
+                # backend_keywords 子串命中
+                kws = m.get('backend_keywords', []) or []
+                hit_kw = [kw for kw in kws if kw and kw in text]
+                if hit_kw:
+                    candidates.append((m, sum(len(k) for k in hit_kw) * 0.5))
+
+        if not candidates:
+            return None
+        # 关键词命中权重*0.5 < 名称命中，优先名称命中；同权重取 controller_count 大
+        candidates.sort(key=lambda x: (x[1], x[0].get('controller_count', 0)), reverse=True)
+        return candidates[0][0].get('module_name')
+
+    @staticmethod
+    def _retrieve_platform_context(session: dict) -> str:
+        """Agent 2 平台上下文分析（调知识库图谱）
+
+        组装两部分：
+          1. 平台架构快照（模块的 controllers/apis/frontend_pages/external_deps）
+          2. 影响范围预警（incoming：谁依赖该模块的核心 controller）
+
+        降级链路：
+          - 微服务挂 → 空串（深度模式仍可跑，无图谱上下文）
+          - 无匹配模块 → 提示"未匹配到平台模块，基于需求自由设计"
+          - 无 controller → 跳过影响范围部分
+          - impact 无 incoming → 影响范围空，不阻塞
+        """
+        user_input = (session.get('user_input', '') or '').strip()
+        if not user_input:
+            return ''
+        # Agent1 feature_name 比 user_input 更结构化，辅助模块匹配
+        import json as _json
+        _arts = _json.loads(session.get('deep_artifacts', '{}') or '{}')
+        _a1 = _arts.get('agent1', {}) or {}
+        _feature = (_a1.get('requirements', {}) or {}).get('feature_name', '') or ''
+        match_text = f'{user_input} {_feature}'.strip()
+
+        # Step 1: 取 12 模块清单 + 匹配
+        modules_data = PRDGenService._kb_graph_get('/modules')
+        if not modules_data:
+            logger.info('[PRDGen] Agent2 平台上下文: 微服务未启动，降级空串')
+            return ''
+        modules = modules_data.get('modules', [])
+        module_name = PRDGenService._match_module(match_text, modules)
+        if not module_name:
+            return '【平台架构快照】\n未匹配到平台模块，基于需求自由设计。'
+
+        # Step 2: 拿架构快照
+        from urllib.parse import quote
+        overview = PRDGenService._kb_graph_get(f'/modules/{quote(module_name, safe="")}')
+        if not overview:
+            return f'【平台架构快照】\n模块「{module_name}」详情获取失败，基于需求设计。'
+
+        controllers = overview.get('controllers', []) or []
+        apis = overview.get('apis', []) or []
+        frontend_pages = overview.get('frontend_pages', []) or []
+        external_deps = overview.get('external_deps', []) or []
+        services = overview.get('services', []) or []
+
+        parts = [f'【平台架构快照】模块「{module_name}」']
+        parts.append(f'- Controllers: {len(controllers)} 个')
+        if controllers:
+            ctrl_names = [c.get('name', c.get('node_id', '')) for c in controllers[:8]]
+            parts.append(f'  代表: {", ".join(n for n in ctrl_names if n)[:200]}')
+        parts.append(f'- Services: {len(services)} 个')
+        parts.append(f'- APIs: {len(apis)} 个')
+        parts.append(f'- 前端页面: {len(frontend_pages)} 个')
+        if external_deps:
+            dep_names = [d.get('name', d.get('node_id', '')) for d in external_deps[:5]]
+            parts.append(f'- 外部依赖: {", ".join(n for n in dep_names if n)[:150]}')
+
+        # Step 3b: 查该模块的页面布局（design_layouts）
+        layout_parts = []
+        try:
+            import requests as _req
+            lay_resp = _req.get(f'{KB_BASE_URL}/api/admin/design-layouts', timeout=10)
+            if lay_resp.ok:
+                all_pages = lay_resp.json().get('data', {}).get('modules', {})
+                # 模块名简写匹配: "模型训练" → all_pages 中找含 "training" 的 key
+                matched_key = None
+                for mk in all_pages:
+                    if module_name[:4] in mk or mk[:4] in module_name:
+                        matched_key = mk
+                        break
+                    # backend_keywords 匹配
+                    for kw in (modules_data.get('modules', []) or []):
+                        if kw.get('module_name') == module_name:
+                            for bk in (kw.get('backend_keywords', []) or []):
+                                if bk[:4].lower() in mk.lower():
+                                    matched_key = mk
+                                    break
+                if matched_key:
+                    pages = all_pages[matched_key]
+                    layout_parts.append(f'\n【页面布局】模块「{module_name}」有 {len(pages)} 个页面:')
+                    for p in pages:
+                        comps = ', '.join(p.get('layout_components', []) or [])
+                        layout_parts.append(f'  - {p.get("page_id","?")} [{p.get("page_type","?")}] 组件: [{comps}]')
+                else:
+                    # 展示全平台页面类型分布
+                    type_counts = lay_resp.json().get('data', {}).get('page_type_counts', {})
+                    layout_parts.append(f'\n【页面布局】全平台页面类型: {dict(type_counts)}')
+        except Exception as _e:
+            logger.warning(f'[PRDGen] 页面布局查询失败: {_e}')
+
+        if layout_parts:
+            parts.append('\n'.join(layout_parts))
+
+        # Step 3: 拿影响范围（incoming：谁依赖该模块核心 controller）
+        impact_text = ''
+        if controllers:
+            ctrl_node = controllers[0].get('node_id') or controllers[0].get('name', '')
+            if ctrl_node:
+                impact = PRDGenService._kb_graph_get(
+                    '/graph/impact',
+                    params={'node': ctrl_node, 'direction': 'incoming', 'depth': 3},
+                )
+                if impact:
+                    impacted = impact.get('impacted', []) or []
+                    summary = impact.get('summary_by_type', {}) or {}
+                    candidates = impact.get('candidates', [])
+                    if candidates:
+                        # 名称多候选，列出全部供 Agent 2 / 人工二次确认
+                        impact_text = f'\n\n【影响范围预警】节点「{ctrl_node}」匹配多候选，需二次确认: '
+                        impact_text += ', '.join(c.get('name', '') for c in candidates[:5])
+                    elif impacted:
+                        impact_text = f'\n\n【影响范围预警】修改「{module_name}」会影响（incoming，谁依赖我）:'
+                        impact_lines = []
+                        for item in impacted[:10]:
+                            node = item.get('node', {}) or {}
+                            impact_lines.append(
+                                f'  - [{node.get("node_type", "?")}] '
+                                f'{node.get("name", "?")} (深度 {item.get("depth", "?")})'
+                            )
+                        impact_text += '\n' + '\n'.join(impact_lines)
+                        if summary:
+                            dist = ', '.join(f'{k}×{v}' for k, v in sorted(summary.items(), key=lambda x: -x[1])[:6])
+                            impact_text += f'\n影响节点类型分布: {dist}'
+                    else:
+                        impact_text = f'\n\n【影响范围预警】模块「{module_name}」核心 controller 无 incoming 依赖（可能是叶子模块）。'
+
+        parts.append('⚠️ 建议在 PRD 中覆盖上述下游影响，并考虑与已有模块的接口契约。')
+        return '\n'.join(parts) + impact_text
 
     @staticmethod
     def _build_preceding_sections_text(session: dict, current_section: str) -> str:
@@ -623,7 +930,8 @@ class PRDGenService:
 
     # ── 简单模式 ──
 
-    def simple_generate(self, session_id: str, api_key: str, base_url: str, model: str):
+    def simple_generate(self, session_id: str, api_key: str, base_url: str, model: str,
+                        rag_enabled: bool = True):
         """简单模式生成流程
 
         1. 生成大纲 → 存入 session
@@ -651,7 +959,9 @@ class PRDGenService:
             section_name = _SECTION_NAMES.get(section, section)
             yield sse_event('progress', {'step': section, 'message': f'正在生成章节「{section_name}」...'})
 
-            collected_info = self._build_collected_info_text(session)
+            collected_info = self._build_collected_info_text(
+                session, current_section=section, rag_enabled=rag_enabled,
+            )
             preceding_text = self._build_preceding_sections_text(session, section)
             full_context = collected_info
             if preceding_text:
@@ -920,7 +1230,8 @@ class PRDGenService:
 
     # ── 章节流式生成 ──
 
-    def generate_section(self, session_id: str, section: str, api_key: str, base_url: str, model: str):
+    def generate_section(self, session_id: str, section: str, api_key: str, base_url: str, model: str,
+                         rag_enabled: bool = True):
         """流式生成单个章节
 
         如果章节已存在，先自动保存版本快照再重新生成。
@@ -935,7 +1246,9 @@ class PRDGenService:
             return
 
         llm = self._make_llm(api_key, base_url, model)
-        collected_info = self._build_collected_info_text(session)
+        collected_info = self._build_collected_info_text(
+            session, current_section=section, rag_enabled=rag_enabled,
+        )
         preceding_text = self._build_preceding_sections_text(session, section)
         section_name = _SECTION_NAMES.get(section, section)
 
@@ -977,9 +1290,10 @@ class PRDGenService:
             'versionId': version_info['id'],
         })
 
-    def regenerate_section(self, session_id: str, section: str, api_key: str, base_url: str, model: str):
+    def regenerate_section(self, session_id: str, section: str, api_key: str, base_url: str, model: str,
+                           rag_enabled: bool = True):
         """重新生成章节（保存快照后生成）"""
-        yield from self.generate_section(session_id, section, api_key, base_url, model)
+        yield from self.generate_section(session_id, section, api_key, base_url, model, rag_enabled)
 
     # ── 章节内容存取辅助 ──
 
@@ -1048,6 +1362,300 @@ class PRDGenService:
             return '# PRD 草稿\n\n（内容尚未生成）'
 
         return '\n\n---\n\n'.join(sections)
+
+    def export_to_feishu(self, session_id: str) -> dict:
+        """将生成的 PRD 写入飞书文档
+
+        复用 feishu_client.create_doc_xml + markdown_to_docxml。
+        成功后保存 doc_url 到 session.feishu_doc_url。
+        """
+        from .feishu_client import create_doc_xml, markdown_to_docxml, LarkCliError
+
+        session = self.get_session(session_id)
+        if not session:
+            return {'error': '会话不存在'}
+
+        markdown = self.export_prd(session_id)
+        if not markdown or markdown.startswith('# PRD\n\n（会话不存在）') or markdown.startswith('# PRD 草稿'):
+            return {'error': 'PRD 内容尚未生成，请先完成章节生成'}
+
+        user_input = (session.get('user_input', '') or '未命名PRD')[:30]
+        title = f'PRD-{user_input}'
+
+        try:
+            content_xml = markdown_to_docxml(markdown, title)
+            doc_url = create_doc_xml(title, content_xml)
+        except LarkCliError as e:
+            logger.warning(f'[PRDGen] 飞书文档创建失败: {e}')
+            return {'error': f'飞书文档创建失败: {str(e)}'}
+        except Exception as e:
+            logger.warning(f'[PRDGen] 飞书导出异常: {e}')
+            return {'error': f'飞书导出异常: {str(e)}'}
+
+        if not doc_url:
+            return {'error': '飞书文档创建成功但返回 URL 为空'}
+
+        self.update_session(session_id, feishu_doc_url=doc_url)
+        return {'url': doc_url, 'title': title}
+
+    # ── 深度模式状态机（4 Agent + 6 校验器 + 3 人工闸口）──
+
+    def deep_generate(self, session_id: str, api_key: str, base_url: str, model: str,
+                      rag_enabled: bool = True):
+        """深度模式 SSE 流式编排
+
+        流水线：
+          Agent1(萃取,flash) → V:Schema → [fail→Agent1] → Gate1(冲突确认)
+          → Agent2(上下文,pro) → Gate2(影响确认)
+          → Agent3(规格,pro) → V:Scope/Citation/Accept/Perm → [fail→Agent3] → Gate3(规格确认)
+          → Agent4(撰写,flash) → V:Risk → done
+
+        闸口用 threading.Event 挂起 generator，POST /deep/approve 唤醒。
+        状态存 prd_sessions.deep_state + deep_artifacts。
+
+        Yields:
+            SSE 事件：
+              progress / agent_complete / validation / gate / complete / error
+        """
+        from .deep_agents import agent1_extract_pass1, agent1_extract_pass2, agent2_analyze, agent3_spec, agent4_write
+        from .validators import run_validators
+        from .deep_gates import get_or_create_gate, get_gate_response, cleanup_session
+
+        MAX_RETRY = 2  # 校验器回退上限
+
+        session = self.get_session(session_id)
+        if not session:
+            yield sse_event('error', {'message': '会话不存在'})
+            return
+
+        user_input = session.get('user_input', '')
+        artifacts = json.loads(session.get('deep_artifacts', '{}') or '{}')
+
+        try:
+            # ── Agent 1：需求萃取（双 pass：先问知识库再产出）──
+            yield sse_event('progress', {
+                'agent': 'agent1', 'step': 'agent1_pass1',
+                'message': '需求萃取中（第 1 轮：初步分析 + 知识库查询）',
+            })
+
+            # 提前获取平台上下文（Agent1 Pass1 可据此判断是否需要问 KB）
+            platform_context = self._retrieve_platform_context(session)
+
+            pass1_out = agent1_extract_pass1(session, api_key, base_url, model, platform_context)
+            questions = pass1_out.get('questions_to_kb', []) or []
+            artifacts['agent1_pass1'] = pass1_out
+            self.update_session(session_id, deep_artifacts=artifacts)
+            yield sse_event('agent_complete', {
+                'agent': 'agent1_pass1', 'data': pass1_out,
+                'message': f'初步分析完成（{len(questions)} 个知识库问题待查询）',
+            })
+
+            # ── 问知识库（questions_to_kb→/api/query）──
+            kb_answers_parts = []
+            if questions:
+                qs = [q.get('question', '') if isinstance(q, dict) else str(q) for q in questions]
+                qs = [q for q in qs if q.strip()]
+                yield sse_event('progress', {
+                    'agent': 'agent1', 'step': 'agent1_kb_query',
+                    'message': f'正在查询知识库（{len(qs)} 个问题）…',
+                })
+                for i, q in enumerate(qs):
+                    contexts = self._query_kb_agent(q)
+                    if contexts:
+                        ctx_text = '\n'.join(
+                            f'  [{c.get("collection","?")}][{c.get("score","0"):.2f}] {c.get("content","")[:500]}'
+                            for c in contexts[:3]
+                        )
+                        kb_answers_parts.append(f'问题{i+1}: {q}\n回答:\n{ctx_text}')
+                    else:
+                        kb_answers_parts.append(f'问题{i+1}: {q}\n回答: （无相关结果）')
+                yield sse_event('progress', {
+                    'agent': 'agent1', 'step': 'agent1_pass2',
+                    'message': '知识库查询完成，融合信息产出最终需求…',
+                })
+
+            kb_answers_text = '\n\n'.join(kb_answers_parts) if kb_answers_parts else ''
+
+            retry = 0
+            while retry <= MAX_RETRY:
+                agent1_out = agent1_extract_pass2(session, api_key, base_url, model, kb_answers_text)
+                artifacts['agent1'] = agent1_out
+                self.update_session(session_id, deep_state='agent1_done', deep_artifacts=artifacts)
+                yield sse_event('agent_complete', {
+                    'agent': 'agent1', 'data': agent1_out,
+                    'message': '需求萃取完成（含知识库参考）',
+                })
+                # V: Schema
+                issues = run_validators('agent1', artifacts)
+                errors = [i for i in issues if i['level'] == 'error']
+                if errors:
+                    yield sse_event('validation', {'stage': 'agent1', 'validator': 'schema', 'issues': errors})
+                    if retry < MAX_RETRY:
+                        retry += 1
+                        yield sse_event('progress', {
+                            'agent': 'agent1', 'step': 'agent1_retry',
+                            'message': f'Schema 校验失败 {len(errors)} 项，回退 Agent1 重跑（{retry}/{MAX_RETRY}）',
+                        })
+                        continue
+                break
+
+            # ── Gate 1：需求萃取审核（始终显示，供用户确认/修改 Agent1 产出）──
+            gate1 = get_or_create_gate(session_id, 'agent1_review')
+            yield sse_event('gate', {
+                'gate': 'agent1_review',
+                'requirements': artifacts['agent1'].get('requirements', {}),
+                'conflicts': artifacts['agent1'].get('conflicts', []) or [],
+                'gaps': artifacts['agent1'].get('gaps', []) or [],
+                'message': 'Agent 1 已萃取完成，请确认需求信息是否准确。可修改后继续。',
+            })
+            gate1.wait()
+            resp = get_gate_response(session_id, 'agent1_review') or {}
+            if not resp.get('approved'):
+                yield sse_event('complete', {'sessionId': session_id, 'message': '用户在需求审核闸口驳回，深度模式终止'})
+                return
+            if resp.get('modifications'):
+                artifacts['agent1']['_user_modifications'] = resp['modifications']
+                artifacts.setdefault('user_fixes', []).append({'gate': 'agent1_review', 'content': resp['modifications']})
+                self.update_session(session_id, deep_artifacts=artifacts)
+
+            # ── Agent 2：上下文分析（调知识库图谱，降级空串）──
+            yield sse_event('progress', {
+                'agent': 'agent2', 'step': 'agent2',
+                'message': 'Agent 2 上下文分析中…（平台图谱查询）',
+            })
+            user_fixes = artifacts.get('user_fixes', []) or []
+            user_ctx = ('【用户修正】\n' + '\n'.join(
+                '  [{0}]: {1}'.format(g.get('gate', ''), (g.get('content', '') or '')[:300])
+                for g in user_fixes
+            )) if user_fixes else ''
+            agent2_out = agent2_analyze(session, artifacts['agent1'], api_key, base_url, model, user_ctx)
+            artifacts['agent2'] = agent2_out
+            self.update_session(session_id, deep_state='agent2_done', deep_artifacts=artifacts, status='writing')
+            yield sse_event('agent_complete', {
+                'agent': 'agent2', 'data': agent2_out,
+                'message': 'Agent 2 上下文分析完成',
+            })
+
+            # ── Gate 2：影响范围确认（Agent2 之后）──
+            impact_warnings = agent2_out.get('impact_warnings', []) or []
+            if impact_warnings:
+                gate2 = get_or_create_gate(session_id, 'impact')
+                yield sse_event('gate', {
+                    'gate': 'impact', 'impact_warnings': impact_warnings,
+                    'message': '影响范围预警，请确认',
+                })
+                gate2.wait()
+                resp = get_gate_response(session_id, 'impact') or {}
+                if not resp.get('approved'):
+                    yield sse_event('complete', {
+                        'sessionId': session_id,
+                        'message': '用户在影响闸口驳回，深度模式终止',
+                    })
+                    return
+                if resp.get('modifications'):
+                    artifacts['agent2']['_user_modifications'] = resp['modifications']
+                    artifacts.setdefault('user_fixes', []).append({'gate': 'impact', 'content': resp['modifications']})
+                    self.update_session(session_id, deep_artifacts=artifacts)
+
+            # ── Agent 3：功能规格（pro）──
+            yield sse_event('progress', {
+                'agent': 'agent3', 'step': 'agent3',
+                'message': 'Agent 3 功能规格定义中…',
+            })
+            user_fixes = artifacts.get('user_fixes', []) or []
+            user_ctx = ('【用户修正】\n' + '\n'.join(
+                '  [{0}]: {1}'.format(g.get('gate', ''), (g.get('content', '') or '')[:300])
+                for g in user_fixes
+            )) if user_fixes else ''
+            retry = 0
+            while retry <= MAX_RETRY:
+                agent3_out = agent3_spec(session, artifacts['agent1'], artifacts['agent2'],
+                                         api_key, base_url, model, user_ctx)
+                artifacts['agent3'] = agent3_out
+                self.update_session(session_id, deep_state='agent3_done', deep_artifacts=artifacts)
+                yield sse_event('agent_complete', {
+                    'agent': 'agent3', 'data': agent3_out,
+                    'message': 'Agent 3 功能规格完成',
+                })
+                # V: Scope/Citation/Acceptance/Permission
+                issues = run_validators('agent3', artifacts, user_input)
+                errors = [i for i in issues if i['level'] == 'error']
+                warns = [i for i in issues if i['level'] == 'warn']
+                if warns:
+                    yield sse_event('validation', {'stage': 'agent3', 'issues': warns})
+                if errors:
+                    yield sse_event('validation', {'stage': 'agent3', 'issues': errors, 'retry': True})
+                    if retry < MAX_RETRY:
+                        retry += 1
+                        yield sse_event('progress', {
+                            'agent': 'agent3', 'step': 'agent3_retry',
+                            'message': f'校验失败 {len(errors)} 项，回退 Agent3（{retry}/{MAX_RETRY}）',
+                        })
+                        continue
+                break
+
+            # ── Gate 3：功能规格确认（Agent3 之后）──
+            gate3 = get_or_create_gate(session_id, 'spec')
+            yield sse_event('gate', {
+                'gate': 'spec',
+                'features': artifacts['agent3'].get('features', []),
+                'message': '功能规格定义完成，请确认',
+            })
+            gate3.wait()
+            resp = get_gate_response(session_id, 'spec') or {}
+            if not resp.get('approved'):
+                yield sse_event('complete', {
+                    'sessionId': session_id,
+                    'message': '用户在规格闸口驳回，深度模式终止',
+                })
+                return
+            if resp.get('modifications'):
+                artifacts['agent3']['_user_modifications'] = resp['modifications']
+                artifacts.setdefault('user_fixes', []).append({'gate': 'spec', 'content': resp['modifications']})
+                self.update_session(session_id, deep_artifacts=artifacts)
+
+            # ── Agent 4：PRD 撰写（flash）──
+            yield sse_event('progress', {
+                'agent': 'agent4', 'step': 'agent4',
+                'message': 'Agent 4 PRD 撰写中…',
+            })
+            agent4_out = agent4_write(session, artifacts, api_key, base_url, model, user_ctx)
+            artifacts['agent4'] = agent4_out
+            # PRD Markdown 存入 section_contents（复用导出/编辑能力）
+            prd_md = agent4_out.get('prd_markdown', '')
+            if prd_md:
+                contents = json.loads(session.get('section_contents', '{}') or '{}')
+                contents['deep_prd'] = prd_md
+                self.update_session(
+                    session_id,
+                    deep_state='done', deep_artifacts=artifacts,
+                    section_contents=contents, status='done',
+                )
+            else:
+                self.update_session(session_id, deep_state='done', deep_artifacts=artifacts, status='done')
+            yield sse_event('agent_complete', {
+                'agent': 'agent4',
+                'data': {
+                    'prd_markdown': prd_md,
+                    'spec': agent4_out.get('spec', {}),
+                },
+                'message': 'Agent 4 PRD 撰写完成',
+            })
+
+            # V: Risk
+            risk_issues = run_validators('agent4', artifacts)
+            if risk_issues:
+                yield sse_event('validation', {'stage': 'agent4', 'issues': risk_issues})
+
+            yield sse_event('complete', {
+                'sessionId': session_id,
+                'message': '深度模式完成（4 Agent + 3 闸口），可在 PRD 编辑面板点击"AI 增强原型"生成原型',
+                'artifacts': list(artifacts.keys()),
+                'has_prd': bool(prd_md),
+            })
+
+        finally:
+            cleanup_session(session_id)
 
     # ── 飞书妙记解析 ──
 

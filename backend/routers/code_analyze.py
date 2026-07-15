@@ -26,6 +26,9 @@ def start_analysis():
     start_time = data['start_time']
     end_time = data['end_time']
     git_token = data.get('git_token', '')
+    # 兜底：请求体未传 git_token 时，用全局配置（inject_llm_config 注入的默认值）
+    if not git_token:
+        git_token = g.llm_config.get('git_token', '')
 
     service = CodeAnalyzeService()
 

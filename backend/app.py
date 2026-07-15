@@ -1,4 +1,5 @@
-from flask import Flask, jsonify, g, request
+import os
+from flask import Flask, jsonify, g, request, send_from_directory
 from flask_cors import CORS
 from routers.meeting_todo import meeting_todo_bp
 from routers.iteration_stats import iteration_stats_bp
@@ -31,7 +32,7 @@ def close_db(exception):
 def inject_llm_config():
     """在每个请求开始前注入 LLM 配置到 g 对象
 
-    优先从请求头/body读取（前端传入），兜底从数据库读取已保存配置。
+    优先级：请求头 > 数据库 > 环境变量默认值（对方未配置时用本地默认）
     """
     g.llm_config = get_llm_config()
     # 如果请求头未携带 API Key，兜底使用数据库中的持久化配置
@@ -44,6 +45,14 @@ def inject_llm_config():
                 'model': saved.get('model', 'gpt-4o'),
                 'git_token': saved.get('git_token', ''),
             }
+    # 最后兜底：环境变量默认配置（对方未配置时也能用本地默认配置）
+    if not g.llm_config.get('api_key'):
+        g.llm_config = {
+            'api_key': os.environ.get('DEFAULT_API_KEY', ''),
+            'base_url': os.environ.get('DEFAULT_BASE_URL', 'https://api.openai.com/v1'),
+            'model': os.environ.get('DEFAULT_MODEL', 'gpt-4o'),
+            'git_token': os.environ.get('DEFAULT_GIT_TOKEN', os.environ.get('GIT_TOKEN', '')),
+        }
     # Also inject git_token if present in header
     git_token = request.headers.get('X-Git-Token', '')
     if git_token:
@@ -67,6 +76,41 @@ def health():
         "app": "AI 中控台",
         "version": "0.1.0",
     })
+
+
+# ── 前端静态文件服务（生产环境，Docker 部署用）──
+# 前端 dist 目录：项目根/frontend/dist（容器内 /app/frontend/dist）
+_FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'frontend', 'dist')
+
+
+@app.route('/')
+def serve_index():
+    if os.path.exists(_FRONTEND_DIST):
+        return send_from_directory(_FRONTEND_DIST, 'index.html')
+    return jsonify({"error": "frontend not built"}), 404
+
+
+@app.route('/assets/<path:filename>')
+def serve_assets(filename):
+    """Vite 构建产物，assets 目录下含 JS/CSS"""
+    assets_dir = os.path.join(_FRONTEND_DIST, 'assets')
+    if os.path.exists(assets_dir):
+        return send_from_directory(assets_dir, filename)
+    return jsonify({"error": "asset not found"}), 404
+
+
+@app.route('/<path:path>')
+def serve_spa(path):
+    """SPA fallback：非 /api 路径回退到 index.html"""
+    if path.startswith('api'):
+        return jsonify({"error": "not found"}), 404
+    full_path = os.path.join(_FRONTEND_DIST, path)
+    if os.path.exists(full_path) and os.path.isfile(full_path):
+        return send_from_directory(_FRONTEND_DIST, path)
+    # SPA fallback
+    if os.path.exists(_FRONTEND_DIST):
+        return send_from_directory(_FRONTEND_DIST, 'index.html')
+    return jsonify({"error": "frontend not built"}), 404
 
 
 if __name__ == '__main__':

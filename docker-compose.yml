@@ -1,0 +1,18 @@
+services:
+  ai-app:
+    build: .
+    image: ai-app:latest
+    container_name: ai-app
+    ports:
+      - "5000:5000"
+    volumes:
+      # 持久化数据（SQLite、git 缓存）
+      - ./data:/app/backend/data
+      - ./git-cache:/app/data/git-cache
+      # 飞书 lark-cli 配置目录（对方把 token 配置放这里）
+      - ./lark-config:/app/.dewuclaw/lark-cli-config
+    environment:
+      - LARK_CONFIG_DIR=/app/.dewuclaw/lark-cli-config/cli_aa847daba1bc1bb3
+      # EP Token（AI 编程数据报告用，对方自填）
+      - EP_TOKEN=${EP_TOKEN:-}
+    restart: unless-stopped

@@ -85,7 +85,9 @@ frontend/
     │   ├── MeetingTodo.tsx      # 会议 TODO: 输入链接 → 分屏(逐字稿|待办) → 生成文档
     │   ├── IterationStats.tsx   # 迭代统计: 上传 xlsx → 表格展示 → 写入/导出
     │   ├── AiMeasure.tsx        # AI 报告: 配置 → SSE 流式 → 报告预览(Table + Markdown)
-    │   └── Chat.tsx             # 知识库问答: 对话界面 + 引用来源
+    │   ├── Chat.tsx             # 知识库问答: 对话界面 + 引用来源
+    │   ├── PrdGen.tsx           # PRD 生成 3 模式 + Agent 流水线 + 闸口 + 原型
+    │   └── KbManage.tsx         # 知识库管理 + 历史 PRD CRUD
     ├── components/
     │   ├── AppLayout.tsx        # 侧边栏布局 (260px, 8 个菜单项, 4 个 disabled)
     │   ├── LLMConfigProvider.tsx # LLM 全局配置 Context
@@ -99,15 +101,61 @@ frontend/
     │   ├── meetingTodo.ts       # 会议 TODO API 类型 + 调用
     │   ├── iterationStats.ts    # 迭代统计 API 类型 + 调用
     │   ├── aiMeasure.ts         # AI 报告 API 类型 + SSE 回调
-    │   └── chat.ts              # 知识库 API 类型 + 调用
+    │   ├── chat.ts              # 知识库 API 类型 + 调用
+    │   ├── prdGen.ts            # PRD 生成 API(3 模式 + 深度 SSE + 闸口 + 原型)
+    │   └── kbManage.ts          # 知识库管理 API(图谱/PRD CRUD/组件注册表)
     └── utils/
         ├── apiBase.ts           # API_BASE 常量
         └── sse.ts               # SSE 流式请求工具 (fetch + ReadableStream)
 ```
 
+## 深度模式关键实现细节
+
+### 流水线架构
+```
+Agent1(需求萃取,flash) → 审核闸口 → Agent2(上下文分析,pro,调知识库图谱)
+  → 影响闸口 → Agent3(功能规格,pro) → V:6 校验器 → 规格闸口
+  → Agent4(PRD 撰写,flash) → V:风险 → [可选]Agent5(原型生成,flash) → 完成
+```
+
+### 5 Agent 职责
+
+| Agent | 模型 | 输入 | 输出 |
+|-------|------|------|------|
+| Agent1 需求萃取 | flash | 用户需求 + 妙记 + 文件 + 知识库问答 | 结构化需求 + 冲突 + 信息缺口 |
+| Agent2 上下文分析 | pro | Agent1 + 平台架构快照 + 影响范围 | 模块关系 + 缺失依赖 + 预警 |
+| Agent3 功能规格 | pro | Agent1+Agent2 | features + user_stories + data_models |
+| Agent4 PRD 撰写 | flash | Agent1/2/3 产出 | 9 章节 Markdown PRD + JSON Spec |
+| Agent5 原型生成 | flash | PRD + Spec + 组件注册表 | 产品原型 HTML |
+
+### 3 人工闸口
+`threading.Event` 挂起 SSE generator，用户 POST `/deep/approve` 唤醒。
+- **需求审核闸口**:显示 requirements + gaps + conflicts，支持采纳/忽略/修改
+- **影响范围闸口**:显示 impact_warnings，支持勾选保留 + 编辑文字
+- **规格闸口**:可编辑表格(名称/优先级下拉/移除恢复)，提交修改(```edits```)传给后续 Agent
+
+### 6 校验器
+`validators.py`: Schema/Scope/Citation/Acceptance/Permission/Risk。error 级回退 Agent 重跑(≤2 次)，warn 级标记继续。
+
+### 双模型路由
+`model_router.py`: Agent2/3 强制 `deepseek-v4-pro`(强推理)，Agent1/4/5 用用户配置(默认 flash)。
+Agent2/3 的 base_url 指向 DeepSeek 域，不随用户配置。
+
+### 原型生成
+Agent5 调用微服务 `GET /api/admin/design-layouts`(页面布局) + `GET /api/admin/component-registry`(606 组件)→ 注入 prompt 要求参考平台布局和组件。
+`prototype_renderer.py` 将结构化 sections(table/stat_grid/diff/actions/form) 渲染为纯 CSS HTML。
+
+### 历史 PRD 管理（API_PRD.md）
+kb_manage.py 代理 7 个端点(CRUD + 搜索 + design-layouts + component-registry)。
+KbManage.tsx "历史 PRD" Tab 支持搜索/状态筛选/分页/查看全文/文件导入/删除。
+
+### Agent1 伪 Agentic
+双 pass: pass1 产出 ```questions_to_kb``` → 后端调 KB `/api/query` → pass2 融合 KB 答案产出最终需求。
+prompt 要求 Agent1 主动查询"平台已有相关功能""已有页面和组件""后台 API 和数据模型""现有流程"。
+
 ### SSE 流式通信模式
 
-后端使用 Flask `Response(generator(), mimetype='text/event-stream')`, 前端使用 `fetch` + `ReadableStream` 解析. 事件格式: `event: {type}\ndata: {json}\n\n`. 支持事件类型: `progress`, `section_complete`, `section_error`, `complete`, `error`.
+后端使用 Flask `Response(generator(), mimetype='text/event-stream')`, 前端使用 `fetch` + `ReadableStream` 解析. 事件格式: `event: {type}\ndata: {json}\n\n`. 支持事件类型: `progress`, `section_complete`, `section_error`, `agent_complete`, `gate`, `validation`, `complete`, `error`。深度模式闸口: `gate` 事件后 generator 挂起, 等待 `POST /deep/approve`。
 
 ## 关键实现细节
 
@@ -127,6 +175,14 @@ frontend/
 - 4 模块串行: 活跃率 → 不活跃 → Skills → TL 使用, 每个模块独立 SSE 事件
 - TL 名单硬编码 (27 人)
 - 直接 HTTP 调用 EP drilldown API + Skills API
+
+### 5. PRD 深度模式 (`prd_gen_service.py + deep_agents.py`)
+- 5 Agent 流水线 + 3 闸口 + 6 校验器, SSE 流式编排
+- Agent1 双 pass(伪 Agentic, 自动问 KB 补充平台信息)
+- Agent2 调知识库图谱 API(modules/impact/flow/node) + design_layouts
+- Agent4 prompt 注入前序 Agent 全部产出 + 用户闸口修改(user_ctx)
+- Agent5 读 component_registry + design_layouts → prototype_renderer 产 HTML
+- 空 section 自动重试 1 次
 
 ### 4. 知识库问答 (`chat.py`)
 - 代理到无矩 2.0 FastAPI 微服务 (localhost:8000)
